@@ -42,7 +42,6 @@ internal static class NvidiaPanelTiming
 
         var address = new Address { Gpu = 0, Display = 0 };
         int failures = 0;
-        int saved = 0;
         for (int i = 0; i < nvidiaRates.Length; i++)
         {
             Timing timing = FromDescriptor(nvidiaRates[i], nvidiaDescriptors[i]);
@@ -57,8 +56,6 @@ internal static class NvidiaPanelTiming
                 + ", desktop " + now.Width + "x" + now.Height + " @ " + now.Hz);
             if (tested != 0 || persisted != 0)
                 failures++;
-            else
-                saved++;
 
             if (now.Hz != before.Hz || now.Width != before.Width || now.Height != before.Height)
             {
@@ -71,12 +68,12 @@ internal static class NvidiaPanelTiming
         int returned = RestoreRefresh(240);
         ProbeLog.Line("Desktop returned to 240 Hz, result " + returned + ", signal " + ActiveSignal());
 
-        if (saved > 0)
-        {
-            int cleared = clear(ref address);
-            int flushed = flush(ref address);
-            ProbeLog.Line("Cleared NVIDIA unsupported-resolution cache " + cleared + ", flush " + flushed + ". That cache is what turns VRR off.");
-        }
+        // Clear and persist this cache after every NVIDIA staging attempt, including
+        // partial failures, so stale unsupported-mode entries cannot keep VRR/DRR
+        // unavailable when the accepted timings are later used.
+        int cleared = clear(ref address);
+        int flushed = flush(ref address);
+        ProbeLog.Line("Cleared NVIDIA unsupported-resolution cache " + cleared + ", flush " + flushed + ". This clears the cached blocker; Windows Dynamic Refresh Rate still has to be enabled in Advanced display when offered.");
 
         if (failures != 0)
         {
