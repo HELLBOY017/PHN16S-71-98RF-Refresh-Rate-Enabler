@@ -33,6 +33,8 @@ internal static class NvidiaPanelTiming
         var address = new Address { Gpu = 0, Display = 0 };
         int failures = 0;
         int saved = 0;
+        int acceptedAny = 0;
+
         for (int i = 0; i < rates.Count; i++)
         {
             Timing timing = FromDescriptor(rates[i], descriptors[i]);
@@ -86,9 +88,16 @@ internal static class NvidiaPanelTiming
                 + ", desktop " + now.Width + "x" + now.Height + " @ " + now.Hz);
 
             if (!accepted)
+            {
+                if (rates[i] <= 75)
+                    ProbeLog.Line("NVIDIA rejected " + rates[i] + " Hz. This panel/driver combination does not accept the low-refresh custom timing.");
                 failures++;
+            }
             else
+            {
                 saved++;
+                acceptedAny++;
+            }
 
             if (now.Hz != before.Hz || now.Width != before.Width || now.Height != before.Height)
             {
@@ -108,10 +117,16 @@ internal static class NvidiaPanelTiming
             ProbeLog.Line("Cleared NVIDIA unsupported-resolution cache " + cleared + ", flush " + flushed + ". That cache is what turns VRR off.");
         }
 
+        if (acceptedAny == 0)
+        {
+            ProbeLog.Line("No NVIDIA timing(s) were accepted. Leave the NVIDIA GPU driving the panel and stage again.");
+            return 1;
+        }
+
         if (failures != 0)
         {
-            ProbeLog.Line(failures + " NVIDIA timing(s) were not accepted. Leave the NVIDIA GPU driving the panel and stage again.");
-            return 1;
+            ProbeLog.Line(failures + " NVIDIA timing(s) were not accepted. The accepted timings remain staged; NVIDIA rejected the low-refresh custom timing on this panel.");
+            return 0;
         }
 
         ProbeLog.Line("NVIDIA accepted " + string.Join(", ", rates) + " Hz at the panel pixel clock.");
