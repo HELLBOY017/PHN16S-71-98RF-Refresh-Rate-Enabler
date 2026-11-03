@@ -1,342 +1,132 @@
+using Microsoft.Win32;
 using System.Runtime.InteropServices;
+using System.Windows;
 
+// NVIDIA's custom-timing API rejects this panel's 60/75 Hz modes even though
+// they are within the panel's EDID limits. Stage the same valid Type VII modes
+// as an override on NVIDIA's monitor instance instead. The override builder
+// keeps the original 240 Hz preferred timing in the first DisplayID section and
+// chains the added rates after it, preserving the NVIDIA GPU-only switch mode list.
 internal static class NvidiaPanelTiming
 {
     public static int Apply(IReadOnlyList<int> rates, IReadOnlyList<byte[]> descriptors)
     {
         if (rates.Count != descriptors.Count || rates.Count == 0)
         {
-            ProbeLog.Line("No NVIDIA timings to send.");
+            ProbeLog.Line("No NVIDIA timings to stage.");
             return 1;
         }
 
-        nint lib = Native.LoadLibrary(@"C:\Windows\System32\nvcpl.dll");
-        if (lib == 0)
+        MonitorInfo? monitor = MonitorLocator.FindInternal();
+        if (monitor == null)
         {
-            ProbeLog.Line("NVIDIA control panel library did not load. Nothing was written.");
+            ProbeLog.Line("No active internal monitor was found. No NVIDIA EDID override was written.");
             return 1;
         }
 
-        var init = Bind<InitFn>(lib, "NvCplApiInit");
-        var test = Bind<TestFn>(lib, "NvCplApiCTTest");
-        var clear = Bind<AddressFn>(lib, "NvCplApiClearAllUnsupportedResolutionsFromCacheForDisplay");
-        var flush = Bind<AddressFn>(lib, "NvCplApiFlushUnsupportedResolutionCacheToStorage");
-
-        int rc = init(0, 0);
-        ProbeLog.Line("NvCplApiInit " + rc);
-        if (rc != 0)
-            return 1;
-
-        var before = CurrentMode();
-        ProbeLog.Line("Desktop before NVIDIA timings " + before.Width + "x" + before.Height + " @ " + before.Hz + " Hz, signal " + ActiveSignal());
-
-        var address = new Address { Gpu = 0, Display = 0 };
-        int failures = 0;
-        int saved = 0;
-        int acceptedAny = 0;
-
-        for (int i = 0; i < rates.Count; i++)
+        string[] nvidiaPaths = monitor.RegistryPaths
+            .Where(path => string.Equals(Program.AdapterLabel(path), "NVIDIA", StringComparison.Ordinal))
+            .ToArray();
+        if (nvidiaPaths.Length == 0)
         {
-            Timing timing = FromDescriptor(rates[i], descriptors[i]);
-            int tested = test(ref address, 1, ref timing);
-            string attempt = "EDID porch";
+            ProbeLog.Line("No NVIDIA monitor registry instance was found. No EDID override was written.");
+            return 1;
+        }
 
-            // Low-rate modes built by extending the EDID vertical front porch can
-            // have several thousand front-porch lines. Some NVIDIA driver versions
-            // reject that porch layout even though the same pixel clock and total
-            // line count are valid. Retry by moving blanking from the front porch to
-            // the back porch (implicit in VTotal - active height - Vfp - VSync).
-            // This preserves the pixel clock, VTotal, and actual refresh rate; only
-            // the division of vertical blanking changes. Keep the original EDID-based
-            // timing first, and try conservative porch sizes only after rejection.
-            if (tested != 0 && rates[i] <= 75)
+        var pending = new List<(string Path, byte[] Block0, byte[] Block1, byte[][] Extras)>();
+        try
+        {
+            foreach (string path in nvidiaPaths)
             {
-                int originalVfp = (int)timing.Vfp;
-                int[] retryVfps = { 158, 255, 512, 1024, 2048, 3072 };
-                foreach (int retryVfp in retryVfps.Distinct().Where(v => v < originalVfp && v + timing.VSync < timing.VTotal - timing.Height))
+                using RegistryKey parameters = OpenParameters(path, writable: false);
+                if (parameters.GetSubKeyNames().Contains("EDID_OVERRIDE", StringComparer.OrdinalIgnoreCase))
                 {
-                    Timing candidate = FromDescriptor(rates[i], descriptors[i]);
-                    candidate.Vfp = (uint)retryVfp;
-                    int retryResult = test(ref address, 1, ref candidate);
-                    ProbeLog.Line(rates[i] + " Hz NVIDIA retry with VFP " + retryVfp + ", VBP "
-                        + (candidate.VTotal - candidate.Height - candidate.Vfp - candidate.VSync) + ", test " + retryResult);
-                    if (retryResult == 0)
-                    {
-                        timing = candidate;
-                        tested = retryResult;
-                        attempt = "adjusted VFP " + retryVfp;
-                        break;
-                    }
+                    ProbeLog.Line("An EDID_OVERRIDE already exists on NVIDIA instance " + path + ". Refusing to replace an unknown override; remove it first.");
+                    return 1;
                 }
-            }
 
-            string signal = ActiveSignal();
-            int? persisted = tested == 0 ? test(ref address, 6, ref timing) : null;
-            var now = CurrentMode();
+                if (parameters.GetValue("EDID") is not byte[] originalEdid || originalEdid.Length < 256)
+                {
+                    ProbeLog.Line("NVIDIA EDID at " + path + " is missing or shorter than 256 bytes.");
+                    return 1;
+                }
 
-            // The observed CTTest return conventions differ by operation: operation 1
-            // returns 0 when accepted, while operation 6 returns 1 when it applies the
-            // custom timing. In particular, a successful operation 6 changes the active
-            // desktop mode, so treating every nonzero value as failure is incorrect.
-            bool accepted = tested == 0 && persisted == 1;
-            uint vBackPorch = timing.VTotal - timing.Height - timing.Vfp - timing.VSync;
-            ProbeLog.Line(rates[i] + " Hz requested, " + timing.ActualRefresh.ToString("0.0000")
-                + " Hz from timing  test " + tested + ", save " + (persisted?.ToString() ?? "skipped (test failed)")
-                + ", accepted " + accepted + ", layout " + attempt + ", VFP " + timing.Vfp + ", VBP " + vBackPorch
-                + ", clock " + timing.PixelClock.ToString("0.000") + " MHz, total "
-                + timing.HTotal + "x" + timing.VTotal + ", signal " + signal
-                + ", desktop " + now.Width + "x" + now.Height + " @ " + now.Hz);
-
-            if (!accepted)
-            {
-                if (rates[i] <= 75)
-                    ProbeLog.Line("NVIDIA rejected " + rates[i] + " Hz. This panel/driver combination does not accept the low-refresh custom timing.");
-                failures++;
-            }
-            else
-            {
-                saved++;
-                acceptedAny++;
-            }
-
-            if (now.Hz != before.Hz || now.Width != before.Width || now.Height != before.Height)
-            {
-                int restored = Restore(before);
-                var after = CurrentMode();
-                ProbeLog.Line("Restored desktop " + restored + ", now " + after.Width + "x" + after.Height + " @ " + after.Hz);
+                PanelEdid.BuildOverride(originalEdid, descriptors,
+                    out byte[] block0, out byte[] block1, out byte[][] extras);
+                pending.Add((path, block0, block1, extras));
             }
         }
-
-        int returned = RestoreRefresh(240);
-        ProbeLog.Line("Desktop returned to 240 Hz, result " + returned + ", signal " + ActiveSignal());
-
-        if (saved > 0)
+        catch (Exception ex)
         {
-            int cleared = clear(ref address);
-            int flushed = flush(ref address);
-            ProbeLog.Line("Cleared NVIDIA unsupported-resolution cache " + cleared + ", flush " + flushed + ". That cache is what turns VRR off.");
-        }
-
-        if (acceptedAny == 0)
-        {
-            ProbeLog.Line("No NVIDIA timing(s) were accepted. Leave the NVIDIA GPU driving the panel and stage again.");
+            ProbeLog.Line("Could not build the NVIDIA EDID override. Nothing was written.");
+            ProbeLog.Line(ex.ToString());
             return 1;
         }
 
-        if (failures != 0)
+        var writtenPaths = new List<string>();
+        try
         {
-            ProbeLog.Line(failures + " NVIDIA timing(s) were not accepted. The accepted timings remain staged; NVIDIA rejected the low-refresh custom timing on this panel.");
+            foreach (var item in pending)
+            {
+                WriteBlocks(item.Path, item.Block0, item.Block1, item.Extras);
+                writtenPaths.Add(item.Path);
+                ProbeLog.Line("Staged NVIDIA EDID override at " + item.Path + ".");
+            }
+        }
+        catch (Exception ex)
+        {
+            foreach (string path in writtenPaths)
+            {
+                try { DeleteOverride(path); }
+                catch (Exception rollbackError) { ProbeLog.Line("Rollback failed at " + path + ": " + rollbackError.Message); }
+            }
+            ProbeLog.Line("Writing the NVIDIA EDID override failed; staged keys were rolled back where possible.");
+            ProbeLog.Line(ex.ToString());
+            return 1;
+        }
+
+        ProbeLog.Line("Staged " + string.Join(", ", rates) + " Hz on the NVIDIA EDID, keeping the original 240 Hz preferred timing.");
+        ProbeLog.Line("A display-driver restart is required to load the NVIDIA EDID override.");
+        DialogResult restart = MessageBox.Show(
+            "The NVIDIA EDID override is staged. Restart the display driver now to load the new modes? The screen may go black briefly; press F8 within 15 seconds to recover the native 240 Hz timing.",
+            "Restart NVIDIA display driver",
+            MessageBoxButton.OKCancel,
+            MessageBoxImage.Warning);
+        if (restart != MessageBoxResult.OK)
+        {
+            ProbeLog.Line("Driver restart skipped. Click Restart driver later to load the staged NVIDIA rates.");
             return 0;
         }
 
-        ProbeLog.Line("NVIDIA accepted " + string.Join(", ", rates) + " Hz at the panel pixel clock.");
-        return 0;
+        string outcome = DriverRestart.Restart(monitor);
+        ProbeLog.Line(outcome);
+        return outcome.StartsWith("Restarted", StringComparison.Ordinal) ? 0 : 1;
     }
 
-    private static Timing FromDescriptor(int hz, byte[] descriptor)
+    private static RegistryKey OpenParameters(string path, bool writable)
     {
-        int clockKhz = 1 + descriptor[0] + (descriptor[1] << 8) + (descriptor[2] << 16);
-        int hActive = 1 + descriptor[4] + (descriptor[5] << 8);
-        int hBlank = 1 + descriptor[6] + (descriptor[7] << 8);
-        int hFront = 1 + descriptor[8] + ((descriptor[9] & 0x7F) << 8);
-        int hSync = 1 + descriptor[10] + (descriptor[11] << 8);
-        bool hPositive = (descriptor[9] & 0x80) != 0;
-        int vActive = 1 + descriptor[12] + (descriptor[13] << 8);
-        int vBlank = 1 + descriptor[14] + (descriptor[15] << 8);
-        int vFront = 1 + descriptor[16] + ((descriptor[17] & 0x7F) << 8);
-        int vSync = 1 + descriptor[18] + (descriptor[19] << 8);
-        bool vPositive = (descriptor[17] & 0x80) != 0;
-        int hTotal = hActive + hBlank;
-        int vTotal = vActive + vBlank;
-        float actualRefresh = (float)((clockKhz * 1000.0) / (hTotal * (double)vTotal));
-
-        return new Timing
-        {
-            CbSize = 0x64,
-            Width = (uint)hActive,
-            Height = (uint)vActive,
-            Flags = 0x20,
-            RefreshInt = (uint)hz,
-            FrontX = (uint)hActive,
-            FrontY = (uint)vActive,
-            Scaling = 0,
-            Formula = 5,
-            BackX = (uint)hActive,
-            BackY = (uint)vActive,
-            Interlaced = 0,
-            RequestedRefresh = hz,
-            ActualRefresh = actualRefresh,
-            Hfp = (uint)hFront,
-            HTotal = (uint)hTotal,
-            HSync = (uint)hSync,
-            HPol = hPositive ? 0u : 1u,
-            Vfp = (uint)vFront,
-            VTotal = (uint)vTotal,
-            VSync = (uint)vSync,
-            VPol = vPositive ? 0u : 1u,
-            PixelClock = clockKhz / 1000f,
-            Ce = 0
-        };
+        const string prefix = @"\Registry\Machine\";
+        if (path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            path = path[prefix.Length..];
+        return Registry.LocalMachine.OpenSubKey(path, writable)
+            ?? throw new InvalidOperationException("Could not open " + path);
     }
 
-    private static T Bind<T>(nint module, string name) where T : Delegate
+    private static void WriteBlocks(string path, byte[] block0, byte[] block1, byte[][] extras)
     {
-        nint address = Native.GetProcAddress(module, name);
-        if (address == 0)
-            throw new InvalidOperationException("nvcpl.dll is missing " + name);
-        return Marshal.GetDelegateForFunctionPointer<T>(address);
+        using RegistryKey key = OpenParameters(path, writable: true);
+        using RegistryKey over = key.CreateSubKey("EDID_OVERRIDE", writable: true)
+            ?? throw new InvalidOperationException("Could not create EDID_OVERRIDE at " + path);
+        over.SetValue("0", block0, RegistryValueKind.Binary);
+        over.SetValue("1", block1, RegistryValueKind.Binary);
+        for (int i = 0; i < extras.Length; i++)
+            over.SetValue((i + 2).ToString(), extras[i], RegistryValueKind.Binary);
     }
 
-    private static string ActiveSignal()
+    private static void DeleteOverride(string path)
     {
-        if (Signal.GetDisplayConfigBufferSizes(2, out uint pathCount, out uint modeCount) != 0)
-            return "unavailable";
-        var paths = new byte[pathCount * 72];
-        var modes = new byte[modeCount * 64];
-        if (Signal.QueryDisplayConfig(2, ref pathCount, paths, ref modeCount, modes, 0) != 0)
-            return "unavailable";
-
-        var parts = new List<string>();
-        for (int i = 0; i < modeCount; i++)
-        {
-            if (BitConverter.ToInt32(modes, i * 64) != 2)
-                continue;
-            ulong pixel = BitConverter.ToUInt64(modes, i * 64 + 16);
-            uint totalW = BitConverter.ToUInt32(modes, i * 64 + 48);
-            uint totalH = BitConverter.ToUInt32(modes, i * 64 + 52);
-            parts.Add(pixel + " Hz, " + totalW + "x" + totalH);
-        }
-        return parts.Count == 0 ? "no target" : string.Join("; ", parts);
-    }
-
-    private static Desktop CurrentMode()
-    {
-        var mode = new DevMode { dmSize = (short)Marshal.SizeOf<DevMode>() };
-        Signal.EnumDisplaySettingsW(null, -1, ref mode);
-        return new Desktop(mode.dmPelsWidth, mode.dmPelsHeight, mode.dmDisplayFrequency, mode);
-    }
-
-    private static int Restore(Desktop desktop)
-    {
-        DevMode mode = desktop.Raw;
-        return Signal.ChangeDisplaySettingsExW(null, ref mode, 0, 0, 0);
-    }
-
-    private static int RestoreRefresh(int hz)
-    {
-        for (int i = 0; ; i++)
-        {
-            var mode = new DevMode { dmSize = (short)Marshal.SizeOf<DevMode>() };
-            if (!Signal.EnumDisplaySettingsW(null, i, ref mode))
-                return -1;
-            if (mode.dmPelsWidth == 2560 && mode.dmPelsHeight == 1600 && mode.dmDisplayFrequency == hz)
-                return Signal.ChangeDisplaySettingsExW(null, ref mode, 0, 0, 0);
-        }
-    }
-
-    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
-    private delegate int InitFn(int a, int b);
-
-    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
-    private delegate int AddressFn(ref Address address);
-
-    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
-    private delegate int TestFn(ref Address address, int op, ref Timing timing);
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct Address
-    {
-        public uint Gpu;
-        public uint Display;
-    }
-
-    [StructLayout(LayoutKind.Explicit, Size = 0x64)]
-    private struct Timing
-    {
-        [FieldOffset(0x00)] public uint CbSize;
-        [FieldOffset(0x04)] public uint Width;
-        [FieldOffset(0x08)] public uint Height;
-        [FieldOffset(0x0C)] public uint Flags;
-        [FieldOffset(0x10)] public uint RefreshInt;
-        [FieldOffset(0x14)] public uint FrontX;
-        [FieldOffset(0x18)] public uint FrontY;
-        [FieldOffset(0x1C)] public uint Scaling;
-        [FieldOffset(0x20)] public uint Formula;
-        [FieldOffset(0x24)] public uint BackX;
-        [FieldOffset(0x28)] public uint BackY;
-        [FieldOffset(0x2C)] public uint Interlaced;
-        [FieldOffset(0x30)] public float RequestedRefresh;
-        [FieldOffset(0x34)] public float ActualRefresh;
-        [FieldOffset(0x38)] public uint Hfp;
-        [FieldOffset(0x3C)] public uint HTotal;
-        [FieldOffset(0x40)] public uint HSync;
-        [FieldOffset(0x44)] public uint HPol;
-        [FieldOffset(0x48)] public uint Vfp;
-        [FieldOffset(0x4C)] public uint VTotal;
-        [FieldOffset(0x50)] public uint VSync;
-        [FieldOffset(0x54)] public uint VPol;
-        [FieldOffset(0x5C)] public float PixelClock;
-        [FieldOffset(0x60)] public uint Ce;
-    }
-
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    private struct DevMode
-    {
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string? dmDeviceName;
-        public short dmSpecVersion;
-        public short dmDriverVersion;
-        public short dmSize;
-        public short dmDriverExtra;
-        public int dmFields;
-        public int dmPositionX;
-        public int dmPositionY;
-        public int dmDisplayOrientation;
-        public int dmDisplayFixedOutput;
-        public short dmColor;
-        public short dmDuplex;
-        public short dmYResolution;
-        public short dmTTOption;
-        public short dmCollate;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string? dmFormName;
-        public short dmLogPixels;
-        public int dmBitsPerPel;
-        public int dmPelsWidth;
-        public int dmPelsHeight;
-        public int dmDisplayFlags;
-        public int dmDisplayFrequency;
-        public int dmICMMethod;
-        public int dmICMIntent;
-        public int dmMediaType;
-        public int dmDitherType;
-        public int dmReserved1;
-        public int dmReserved2;
-        public int dmPanningWidth;
-        public int dmPanningHeight;
-    }
-
-    private readonly record struct Desktop(int Width, int Height, int Hz, DevMode Raw);
-
-    private static class Native
-    {
-        [DllImport("kernel32", CharSet = CharSet.Unicode, SetLastError = true)]
-        public static extern nint LoadLibrary(string path);
-
-        [DllImport("kernel32", CharSet = CharSet.Ansi, SetLastError = true)]
-        public static extern nint GetProcAddress(nint module, string name);
-    }
-
-    private static class Signal
-    {
-        [DllImport("user32", CharSet = CharSet.Unicode)]
-        public static extern bool EnumDisplaySettingsW(string? device, int mode, ref DevMode devMode);
-
-        [DllImport("user32", CharSet = CharSet.Unicode)]
-        public static extern int ChangeDisplaySettingsExW(string? device, ref DevMode devMode, nint hwnd, int flags, nint param);
-
-        [DllImport("user32")]
-        public static extern int GetDisplayConfigBufferSizes(uint flags, out uint pathCount, out uint modeCount);
-
-        [DllImport("user32")]
-        public static extern int QueryDisplayConfig(uint flags, ref uint pathCount, byte[] paths, ref uint modeCount, byte[] modes, nint topology);
+        using RegistryKey key = OpenParameters(path, writable: true);
+        if (key.GetSubKeyNames().Contains("EDID_OVERRIDE", StringComparer.OrdinalIgnoreCase))
+            key.DeleteSubKeyTree("EDID_OVERRIDE");
     }
 }
