@@ -1,5 +1,4 @@
 # PHN16S-71-98RF Refresh Rate Enabler
-
 Adds 60, 75, 100, 120, 144, and 165 Hz on the Acer Predator Helios Neo 16S (PHN16S-71-98RF).
 
 On the Intel GPU, Windows lists every mode: 240 Hz, 165.02 Hz, 144 Hz, 120 Hz, 100.01 Hz, 75 Hz, and 60 Hz.
