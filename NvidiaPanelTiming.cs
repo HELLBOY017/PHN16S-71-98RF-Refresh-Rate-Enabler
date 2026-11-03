@@ -40,12 +40,19 @@ internal static class NvidiaPanelTiming
             string signal = ActiveSignal();
             int? persisted = tested == 0 ? test(ref address, 6, ref timing) : null;
             var now = CurrentMode();
+
+            // The observed CTTest return conventions differ by operation: operation 1
+            // returns 0 when accepted, while operation 6 returns 1 when it applies the
+            // custom timing. In particular, a successful operation 6 changes the active
+            // desktop mode, so treating every nonzero value as failure is incorrect.
+            bool accepted = tested == 0 && persisted == 1;
             ProbeLog.Line(rates[i] + " Hz requested, " + timing.ActualRefresh.ToString("0.0000")
                 + " Hz from timing  test " + tested + ", save " + (persisted?.ToString() ?? "skipped (test failed)")
-                + ", clock " + timing.PixelClock.ToString("0.000") + " MHz, total "
+                + ", accepted " + accepted + ", clock " + timing.PixelClock.ToString("0.000") + " MHz, total "
                 + timing.HTotal + "x" + timing.VTotal + ", signal " + signal
                 + ", desktop " + now.Width + "x" + now.Height + " @ " + now.Hz);
-            if (tested != 0 || persisted != 0)
+
+            if (!accepted)
                 failures++;
             else
                 saved++;
