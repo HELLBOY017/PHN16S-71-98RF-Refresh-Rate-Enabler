@@ -1,12 +1,12 @@
 using Microsoft.Win32;
-using System.Runtime.InteropServices;
 using System.Windows;
 
 // NVIDIA's custom-timing API rejects this panel's 60/75 Hz modes even though
 // they are within the panel's EDID limits. Stage the same valid Type VII modes
-// as an override on NVIDIA's monitor instance instead. The override builder
-// keeps the original 240 Hz preferred timing in the first DisplayID section and
-// chains the added rates after it, preserving the NVIDIA GPU-only switch mode list.
+// as a monitor EDID override instead, retaining the native 240 Hz preferred mode.
+// EDID_OVERRIDE is attached to the monitor's Enum\DISPLAY instance, not to a
+// GPU-specific NVD0000 instance. The adapter-label heuristic therefore must not
+// be used to find the EDID key for the NVIDIA path.
 internal static class NvidiaPanelTiming
 {
     public static int Apply(IReadOnlyList<int> rates, IReadOnlyList<byte[]> descriptors)
@@ -24,30 +24,34 @@ internal static class NvidiaPanelTiming
             return 1;
         }
 
-        string[] nvidiaPaths = monitor.RegistryPaths
-            .Where(path => string.Equals(Program.AdapterLabel(path), "NVIDIA", StringComparison.Ordinal))
+        // These are the monitor's actual Enum\DISPLAY\<monitor>\<instance>
+        // registry paths. They are the correct location for EDID_OVERRIDE even
+        // when NVIDIA is the active adapter; they are not named NVD0000.
+        string[] monitorPaths = monitor.RegistryPaths
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
-        if (nvidiaPaths.Length == 0)
+        if (monitorPaths.Length == 0)
         {
-            ProbeLog.Line("No NVIDIA monitor registry instance was found. No EDID override was written.");
+            ProbeLog.Line("No monitor EDID registry instances were found. No override was written.");
             return 1;
         }
 
         var pending = new List<(string Path, byte[] Block0, byte[] Block1, byte[][] Extras)>();
         try
         {
-            foreach (string path in nvidiaPaths)
+            foreach (string path in monitorPaths)
             {
                 using RegistryKey parameters = OpenParameters(path, writable: false);
                 if (parameters.GetSubKeyNames().Contains("EDID_OVERRIDE", StringComparer.OrdinalIgnoreCase))
                 {
-                    ProbeLog.Line("An EDID_OVERRIDE already exists on NVIDIA instance " + path + ". Refusing to replace an unknown override; remove it first.");
+                    ProbeLog.Line("An EDID_OVERRIDE already exists at " + path + ". Refusing to replace an unknown override.");
                     return 1;
                 }
 
                 if (parameters.GetValue("EDID") is not byte[] originalEdid || originalEdid.Length < 256)
                 {
-                    ProbeLog.Line("NVIDIA EDID at " + path + " is missing or shorter than 256 bytes.");
+                    ProbeLog.Line("Monitor EDID at " + path + " is missing or shorter than 256 bytes.");
                     return 1;
                 }
 
@@ -58,7 +62,7 @@ internal static class NvidiaPanelTiming
         }
         catch (Exception ex)
         {
-            ProbeLog.Line("Could not build the NVIDIA EDID override. Nothing was written.");
+            ProbeLog.Line("Could not build the NVIDIA monitor EDID override. Nothing was written.");
             ProbeLog.Line(ex.ToString());
             return 1;
         }
@@ -70,7 +74,7 @@ internal static class NvidiaPanelTiming
             {
                 WriteBlocks(item.Path, item.Block0, item.Block1, item.Extras);
                 writtenPaths.Add(item.Path);
-                ProbeLog.Line("Staged NVIDIA EDID override at " + item.Path + ".");
+                ProbeLog.Line("Staged monitor EDID override at " + item.Path + ".");
             }
         }
         catch (Exception ex)
@@ -80,21 +84,21 @@ internal static class NvidiaPanelTiming
                 try { DeleteOverride(path); }
                 catch (Exception rollbackError) { ProbeLog.Line("Rollback failed at " + path + ": " + rollbackError.Message); }
             }
-            ProbeLog.Line("Writing the NVIDIA EDID override failed; staged keys were rolled back where possible.");
+            ProbeLog.Line("Writing the NVIDIA monitor EDID override failed; staged keys were rolled back where possible.");
             ProbeLog.Line(ex.ToString());
             return 1;
         }
 
-        ProbeLog.Line("Staged " + string.Join(", ", rates) + " Hz on the NVIDIA EDID, keeping the original 240 Hz preferred timing.");
-        ProbeLog.Line("A display-driver restart is required to load the NVIDIA EDID override.");
+        ProbeLog.Line("Staged " + string.Join(", ", rates) + " Hz in the monitor EDID override; original 240 Hz preferred timing is preserved.");
+        ProbeLog.Line("The override is monitor-scoped, not GPU-scoped. Restart the display driver to load the NVIDIA modes; press F8 within 15 seconds if the panel stays black.");
         DialogResult restart = MessageBox.Show(
-            "The NVIDIA EDID override is staged. Restart the display driver now to load the new modes? The screen may go black briefly; press F8 within 15 seconds to recover the native 240 Hz timing.",
-            "Restart NVIDIA display driver",
+            "The monitor EDID override is staged. Restart the display driver now to load the new modes? The screen may go black briefly; press F8 within 15 seconds to recover the native 240 Hz timing.",
+            "Restart display driver",
             MessageBoxButton.OKCancel,
             MessageBoxImage.Warning);
         if (restart != MessageBoxResult.OK)
         {
-            ProbeLog.Line("Driver restart skipped. Click Restart driver later to load the staged NVIDIA rates.");
+            ProbeLog.Line("Driver restart skipped. Click Restart driver later to load the staged rates.");
             return 0;
         }
 
