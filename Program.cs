@@ -280,16 +280,20 @@ public static class Program
 
     private static bool IsNvidiaActive(MonitorInfo monitor)
     {
-        CcdSignal? signal = CcdSignal.ReadActive();
+        // A target ID is local to a display adapter and is not the EDID registry
+        // instance's UID. Match the active source by its GDI device name, then
+        // inspect the owning adapter's PCI device path instead.
+        CcdSignal? signal = CcdSignal.ReadActive(monitor.DeviceName);
         if (signal != null)
         {
-            string marker = "UID" + signal.TargetId;
-            foreach (string path in PanelPaths(monitor))
-            {
-                if (path.Contains(marker, StringComparison.OrdinalIgnoreCase))
-                    return string.Equals(AdapterLabel(path), "NVIDIA", StringComparison.Ordinal);
-            }
+            if (signal.AdapterDevicePath.Contains("VEN_10DE", StringComparison.OrdinalIgnoreCase))
+                return true;
+            if (signal.AdapterDevicePath.Contains("VEN_8086", StringComparison.OrdinalIgnoreCase))
+                return false;
         }
+
+        // EnumDisplayDevices supplies the parent adapter for this exact GDI
+        // source. Use it only when DisplayConfig could not identify the adapter.
         return monitor.Adapter.Contains("NVIDIA", StringComparison.OrdinalIgnoreCase);
     }
 
@@ -606,6 +610,8 @@ internal sealed class CcdSignal
     public double RefreshHz { get; init; }
     public uint TargetId { get; init; }
     public string Output { get; init; } = "";
+    public string SourceDeviceName { get; init; } = "";
+    public string AdapterDevicePath { get; init; } = "";
 
     public string Describe()
     {
@@ -616,7 +622,7 @@ internal sealed class CcdSignal
             + RefreshHz.ToString("0.000") + " Hz";
     }
 
-    public static CcdSignal? ReadActive()
+    public static CcdSignal? ReadActive(string? sourceDeviceName = null)
     {
         if (Native.GetDisplayConfigBufferSizes(Native.QdcOnlyActivePaths, out uint pathCount, out uint modeCount) != 0)
             return null;
@@ -624,30 +630,41 @@ internal sealed class CcdSignal
         var modes = new Native.ModeInfo[modeCount];
         if (Native.QueryDisplayConfig(Native.QdcOnlyActivePaths, ref pathCount, paths, ref modeCount, modes, IntPtr.Zero) != 0)
             return null;
-        if (pathCount < 1)
-            return null;
 
-        var path = paths[0];
-        uint modeIndex = path.Target.modeInfoIdx;
-        if (modeIndex >= modeCount || modes[modeIndex].infoType != Native.ModeInfoTypeTarget)
-            return null;
-
-        var video = modes[modeIndex].mode.targetMode.video;
-        double refresh = video.vSyncFreq.Denominator == 0
-            ? 0
-            : video.vSyncFreq.Numerator / (double)video.vSyncFreq.Denominator;
-        string output = path.Target.outputTechnology == 0x80000000 ? "internal panel" : "technology " + path.Target.outputTechnology;
-        return new CcdSignal
+        for (int i = 0; i < pathCount; i++)
         {
-            PixelClockHz = video.pixelRate,
-            HActive = video.activeSize.cx,
-            VActive = video.activeSize.cy,
-            HTotal = video.totalSize.cx,
-            VTotal = video.totalSize.cy,
-            RefreshHz = refresh,
-            TargetId = path.Target.id,
-            Output = output
-        };
+            var path = paths[i];
+            if (!Native.TryGetSourceName(path.Source, out string sourceName))
+                continue;
+            if (!string.IsNullOrWhiteSpace(sourceDeviceName)
+                && !string.Equals(sourceName, sourceDeviceName, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            uint modeIndex = path.Target.modeInfoIdx;
+            if (modeIndex >= modeCount || modes[modeIndex].infoType != Native.ModeInfoTypeTarget)
+                continue;
+
+            var video = modes[modeIndex].mode.targetMode.video;
+            double refresh = video.vSyncFreq.Denominator == 0
+                ? 0
+                : video.vSyncFreq.Numerator / (double)video.vSyncFreq.Denominator;
+            string output = path.Target.outputTechnology == 0x80000000 ? "internal panel" : "technology " + path.Target.outputTechnology;
+            Native.TryGetAdapterDevicePath(path.Source.adapterId, out string adapterPath);
+            return new CcdSignal
+            {
+                PixelClockHz = video.pixelRate,
+                HActive = video.activeSize.cx,
+                VActive = video.activeSize.cy,
+                HTotal = video.totalSize.cx,
+                VTotal = video.totalSize.cy,
+                RefreshHz = refresh,
+                TargetId = path.Target.id,
+                Output = output,
+                SourceDeviceName = sourceName,
+                AdapterDevicePath = adapterPath
+            };
+        }
+        return null;
     }
 }
 
@@ -1185,6 +1202,8 @@ internal static class Native
     public const int EnumCurrentSettings = -1;
     public const uint QdcOnlyActivePaths = 2;
     public const int ModeInfoTypeTarget = 2;
+    private const int DisplayConfigGetSourceName = 1;
+    private const int DisplayConfigGetAdapterName = 4;
 
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
     public struct DisplayDevice
@@ -1237,12 +1256,6 @@ internal static class Native
         public int dmPanningWidth;
         public int dmPanningHeight;
     }
-
-    [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
-    public static extern bool EnumDisplayDevices(string? lpDevice, uint iDevNum, ref DisplayDevice lpDisplayDevice, uint dwFlags);
-
-    [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
-    public static extern bool EnumDisplaySettings(string? deviceName, int modeNum, ref DevMode devMode);
 
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
     public struct Luid
@@ -1342,6 +1355,87 @@ internal static class Native
         public Luid adapterId;
         public ModeUnion mode;
     }
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    private struct DeviceInfoHeader
+    {
+        public int type;
+        public int size;
+        public Luid adapterId;
+        public uint id;
+    }
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    private struct SourceDeviceName
+    {
+        public DeviceInfoHeader header;
+        [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.ByValTStr, SizeConst = 32)]
+        public string viewGdiDeviceName;
+    }
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    private struct AdapterDeviceName
+    {
+        public DeviceInfoHeader header;
+        [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.ByValTStr, SizeConst = 128)]
+        public string adapterDevicePath;
+    }
+
+    public static bool TryGetSourceName(PathSource source, out string name)
+    {
+        var request = new SourceDeviceName
+        {
+            header = new DeviceInfoHeader
+            {
+                type = DisplayConfigGetSourceName,
+                size = Marshal.SizeOf<SourceDeviceName>(),
+                adapterId = source.adapterId,
+                id = source.id
+            },
+            viewGdiDeviceName = ""
+        };
+        if (DisplayConfigGetDeviceInfo(ref request) != 0)
+        {
+            name = "";
+            return false;
+        }
+        name = request.viewGdiDeviceName;
+        return !string.IsNullOrWhiteSpace(name);
+    }
+
+    public static bool TryGetAdapterDevicePath(Luid adapterId, out string path)
+    {
+        var request = new AdapterDeviceName
+        {
+            header = new DeviceInfoHeader
+            {
+                type = DisplayConfigGetAdapterName,
+                size = Marshal.SizeOf<AdapterDeviceName>(),
+                adapterId = adapterId,
+                id = 0
+            },
+            adapterDevicePath = ""
+        };
+        if (DisplayConfigGetDeviceInfo(ref request) != 0)
+        {
+            path = "";
+            return false;
+        }
+        path = request.adapterDevicePath;
+        return !string.IsNullOrWhiteSpace(path);
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, EntryPoint = "DisplayConfigGetDeviceInfo")]
+    private static extern int DisplayConfigGetDeviceInfo(ref SourceDeviceName requestPacket);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, EntryPoint = "DisplayConfigGetDeviceInfo")]
+    private static extern int DisplayConfigGetDeviceInfo(ref AdapterDeviceName requestPacket);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    public static extern bool EnumDisplayDevices(string? lpDevice, uint iDevNum, ref DisplayDevice lpDisplayDevice, uint dwFlags);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    public static extern bool EnumDisplaySettings(string? deviceName, int modeNum, ref DevMode devMode);
 
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     public static extern int GetDisplayConfigBufferSizes(uint flags, out uint numPathArrayElements, out uint numModeInfoArrayElements);
