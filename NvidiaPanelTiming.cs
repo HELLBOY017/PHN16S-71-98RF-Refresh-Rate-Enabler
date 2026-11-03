@@ -38,9 +38,10 @@ internal static class NvidiaPanelTiming
             Timing timing = FromDescriptor(rates[i], descriptors[i]);
             int tested = test(ref address, 1, ref timing);
             string signal = ActiveSignal();
-            int persisted = test(ref address, 6, ref timing);
+            int? persisted = tested == 0 ? test(ref address, 6, ref timing) : null;
             var now = CurrentMode();
-            ProbeLog.Line(rates[i] + " Hz  test " + tested + ", save " + persisted
+            ProbeLog.Line(rates[i] + " Hz requested, " + timing.ActualRefresh.ToString("0.0000")
+                + " Hz from timing  test " + tested + ", save " + (persisted?.ToString() ?? "skipped (test failed)")
                 + ", clock " + timing.PixelClock.ToString("0.000") + " MHz, total "
                 + timing.HTotal + "x" + timing.VTotal + ", signal " + signal
                 + ", desktop " + now.Width + "x" + now.Height + " @ " + now.Hz);
@@ -90,6 +91,9 @@ internal static class NvidiaPanelTiming
         int vFront = 1 + descriptor[16] + ((descriptor[17] & 0x7F) << 8);
         int vSync = 1 + descriptor[18] + (descriptor[19] << 8);
         bool vPositive = (descriptor[17] & 0x80) != 0;
+        int hTotal = hActive + hBlank;
+        int vTotal = vActive + vBlank;
+        float actualRefresh = (float)((clockKhz * 1000.0) / (hTotal * (double)vTotal));
 
         return new Timing
         {
@@ -106,13 +110,13 @@ internal static class NvidiaPanelTiming
             BackY = (uint)vActive,
             Interlaced = 0,
             RequestedRefresh = hz,
-            ActualRefresh = hz,
+            ActualRefresh = actualRefresh,
             Hfp = (uint)hFront,
-            HTotal = (uint)(hActive + hBlank),
+            HTotal = (uint)hTotal,
             HSync = (uint)hSync,
             HPol = hPositive ? 0u : 1u,
             Vfp = (uint)vFront,
-            VTotal = (uint)(vActive + vBlank),
+            VTotal = (uint)vTotal,
             VSync = (uint)vSync,
             VPol = vPositive ? 0u : 1u,
             PixelClock = clockKhz / 1000f,
