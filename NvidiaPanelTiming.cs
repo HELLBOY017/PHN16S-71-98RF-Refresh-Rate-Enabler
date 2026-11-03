@@ -10,6 +10,16 @@ internal static class NvidiaPanelTiming
             return 1;
         }
 
+        // Keep low refresh rates available on Intel, but don't register them with NVIDIA.
+        var nvidiaIndices = Enumerable.Range(0, rates.Count).Where(i => rates[i] >= 100).ToArray();
+        if (nvidiaIndices.Length == 0)
+        {
+            ProbeLog.Line("No NVIDIA timings at 100 Hz or higher to send.");
+            return 1;
+        }
+        var nvidiaRates = nvidiaIndices.Select(i => rates[i]).ToArray();
+        var nvidiaDescriptors = nvidiaIndices.Select(i => descriptors[i]).ToArray();
+
         nint lib = Native.LoadLibrary(@"C:\Windows\System32\nvcpl.dll");
         if (lib == 0)
         {
@@ -33,14 +43,14 @@ internal static class NvidiaPanelTiming
         var address = new Address { Gpu = 0, Display = 0 };
         int failures = 0;
         int saved = 0;
-        for (int i = 0; i < rates.Count; i++)
+        for (int i = 0; i < nvidiaRates.Length; i++)
         {
-            Timing timing = FromDescriptor(rates[i], descriptors[i]);
+            Timing timing = FromDescriptor(nvidiaRates[i], nvidiaDescriptors[i]);
             int tested = test(ref address, 1, ref timing);
             string signal = ActiveSignal();
             int? persisted = tested == 0 ? test(ref address, 6, ref timing) : null;
             var now = CurrentMode();
-            ProbeLog.Line(rates[i] + " Hz requested, " + timing.ActualRefresh.ToString("0.0000")
+            ProbeLog.Line(nvidiaRates[i] + " Hz requested, " + timing.ActualRefresh.ToString("0.0000")
                 + " Hz from timing  test " + tested + ", save " + (persisted?.ToString() ?? "skipped (test failed)")
                 + ", clock " + timing.PixelClock.ToString("0.000") + " MHz, total "
                 + timing.HTotal + "x" + timing.VTotal + ", signal " + signal
@@ -74,7 +84,7 @@ internal static class NvidiaPanelTiming
             return 1;
         }
 
-        ProbeLog.Line("NVIDIA accepted " + string.Join(", ", rates) + " Hz at the panel pixel clock.");
+        ProbeLog.Line("NVIDIA accepted " + string.Join(", ", nvidiaRates) + " Hz at the panel pixel clock.");
         return 0;
     }
 
