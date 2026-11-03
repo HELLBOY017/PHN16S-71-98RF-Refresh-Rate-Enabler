@@ -37,6 +37,37 @@ internal static class NvidiaPanelTiming
         {
             Timing timing = FromDescriptor(rates[i], descriptors[i]);
             int tested = test(ref address, 1, ref timing);
+            string attempt = "EDID porch";
+
+            // Low-rate modes built by extending the EDID vertical front porch can
+            // have several thousand front-porch lines. Some NVIDIA driver versions
+            // reject that porch layout even though the same pixel clock and total
+            // line count are valid. Retry by moving blanking from the front porch to
+            // the back porch (implicit in VTotal - active height - Vfp - VSync).
+            // This preserves the pixel clock, VTotal, and actual refresh rate; only
+            // the division of vertical blanking changes. Keep the original EDID-based
+            // timing first, and try conservative porch sizes only after rejection.
+            if (tested != 0 && rates[i] <= 75)
+            {
+                int originalVfp = (int)timing.Vfp;
+                int[] retryVfps = { 158, 255, 512, 1024, 2048, 3072 };
+                foreach (int retryVfp in retryVfps.Distinct().Where(v => v < originalVfp && v + timing.VSync < timing.VTotal - timing.Height))
+                {
+                    Timing candidate = FromDescriptor(rates[i], descriptors[i]);
+                    candidate.Vfp = (uint)retryVfp;
+                    int retryResult = test(ref address, 1, ref candidate);
+                    ProbeLog.Line(rates[i] + " Hz NVIDIA retry with VFP " + retryVfp + ", VBP "
+                        + (candidate.VTotal - candidate.Height - candidate.Vfp - candidate.VSync) + ", test " + retryResult);
+                    if (retryResult == 0)
+                    {
+                        timing = candidate;
+                        tested = retryResult;
+                        attempt = "adjusted VFP " + retryVfp;
+                        break;
+                    }
+                }
+            }
+
             string signal = ActiveSignal();
             int? persisted = tested == 0 ? test(ref address, 6, ref timing) : null;
             var now = CurrentMode();
@@ -46,9 +77,11 @@ internal static class NvidiaPanelTiming
             // custom timing. In particular, a successful operation 6 changes the active
             // desktop mode, so treating every nonzero value as failure is incorrect.
             bool accepted = tested == 0 && persisted == 1;
+            uint vBackPorch = timing.VTotal - timing.Height - timing.Vfp - timing.VSync;
             ProbeLog.Line(rates[i] + " Hz requested, " + timing.ActualRefresh.ToString("0.0000")
                 + " Hz from timing  test " + tested + ", save " + (persisted?.ToString() ?? "skipped (test failed)")
-                + ", accepted " + accepted + ", clock " + timing.PixelClock.ToString("0.000") + " MHz, total "
+                + ", accepted " + accepted + ", layout " + attempt + ", VFP " + timing.Vfp + ", VBP " + vBackPorch
+                + ", clock " + timing.PixelClock.ToString("0.000") + " MHz, total "
                 + timing.HTotal + "x" + timing.VTotal + ", signal " + signal
                 + ", desktop " + now.Width + "x" + now.Height + " @ " + now.Hz);
 
