@@ -199,6 +199,8 @@ public static class Program
             return 1;
         }
 
+        EnableIntelDrr();
+
         bool wroteIntel = false;
         foreach (string path in paths)
         {
@@ -246,7 +248,7 @@ public static class Program
             return 1;
         }
 
-        ProbeLog.Line("Remove override only removes the Intel EDID override.");
+        ProbeLog.Line("Remove override removes the Intel EDID override and restores driver DRR settings.");
         bool removed = false;
         foreach (string path in IntelPaths(monitor))
         {
@@ -258,6 +260,8 @@ public static class Program
         }
         if (!removed)
             ProbeLog.Line("No Intel EDID_OVERRIDE key.");
+
+        RestoreIntelDrr();
 
         if (IsNvidiaActive(monitor))
         {
@@ -344,6 +348,11 @@ public static class Program
         ProbeLog.Line("Press F8 within 15 seconds if the panel stays black.");
         string outcome = DriverRestart.Restart(monitor);
         ProbeLog.Line(outcome);
+        if (outcome.StartsWith("Restarted", StringComparison.Ordinal))
+        {
+            Thread.Sleep(500);
+            CcdSignal.TryEnableDrrViaCcd();
+        }
         return outcome.StartsWith("Restarted", StringComparison.Ordinal) ? 0 : 1;
     }
 
@@ -433,6 +442,236 @@ public static class Program
 
     private static IReadOnlyList<string> IntelPaths(MonitorInfo monitor)
         => PanelPaths(monitor).Where(path => string.Equals(AdapterLabel(path), "Intel", StringComparison.Ordinal)).ToList();
+
+    private const string DisplayClassGuid = @"{4d36e968-e325-11ce-bfc1-08002be10318}";
+    private const string DisplayClassPath = @"SYSTEM\CurrentControlSet\Control\Class\" + DisplayClassGuid;
+    private const string Dfc2ValueName = "DisplayFeatureControl2";
+    private const string Dfc2BackupValueName = "DisplayFeatureControl2_PreDRR";
+    private const string AlwaysInVrrModeValueName = "AlwaysInVrrMode";
+    private const string AlwaysInVrrModeBackupValueName = "AlwaysInVrrMode_PreDRR";
+    private const string EnableMstVrrValueName = "EnableMstVrr";
+    private const string EnableMstVrrBackupValueName = "EnableMstVrr_PreDRR";
+
+    internal static List<string> FindIntelDriverClassKeys()
+    {
+        var list = new List<string>();
+        using RegistryKey? classKey = Registry.LocalMachine.OpenSubKey(DisplayClassPath, writable: false);
+        if (classKey == null)
+            return list;
+
+        foreach (string subName in classKey.GetSubKeyNames())
+        {
+            if (!int.TryParse(subName, out _))
+                continue;
+
+            using RegistryKey? subKey = classKey.OpenSubKey(subName, writable: false);
+            if (subKey == null)
+                continue;
+
+            string desc = subKey.GetValue("DriverDesc") as string ?? "";
+            string provider = subKey.GetValue("ProviderName") as string ?? "";
+            string matchId = subKey.GetValue("MatchingDeviceId") as string ?? "";
+
+            bool isIntel = matchId.Contains("VEN_8086", StringComparison.OrdinalIgnoreCase)
+                        || provider.Contains("Intel", StringComparison.OrdinalIgnoreCase)
+                        || desc.Contains("Intel", StringComparison.OrdinalIgnoreCase);
+
+            if (isIntel)
+                list.Add(DisplayClassPath + @"\" + subName);
+        }
+        return list;
+    }
+
+    internal static bool IsIntelDrrEnabled()
+    {
+        var keys = FindIntelDriverClassKeys();
+        if (keys.Count == 0)
+            return false;
+
+        foreach (string keyPath in keys)
+        {
+            using RegistryKey? key = Registry.LocalMachine.OpenSubKey(keyPath, writable: false);
+            if (key == null)
+                return false;
+
+            if (key.GetValue(Dfc2ValueName) is int dfc2)
+            {
+                if ((dfc2 & 1) == 0)
+                    return false;
+            }
+            else
+            {
+                return false;
+            }
+
+            if (key.GetValue(AlwaysInVrrModeValueName) is int vrr)
+            {
+                if (vrr != 1)
+                    return false;
+            }
+            else
+            {
+                return false;
+            }
+
+            if (key.GetValue(EnableMstVrrValueName) is int mst)
+            {
+                if (mst != 1)
+                    return false;
+            }
+            else
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    internal static void EnableIntelDrr()
+    {
+        var keys = FindIntelDriverClassKeys();
+        if (keys.Count == 0)
+        {
+            ProbeLog.Line("No Intel display adapter registry key found for DRR.");
+            return;
+        }
+
+        foreach (string keyPath in keys)
+        {
+            try
+            {
+                using RegistryKey? key = Registry.LocalMachine.OpenSubKey(keyPath, writable: true);
+                if (key == null)
+                {
+                    ProbeLog.Line("Could not open " + keyPath + " for DRR configuration.");
+                    continue;
+                }
+
+                // 1. DisplayFeatureControl2 bit 0
+                object? dfc2Obj = key.GetValue(Dfc2ValueName);
+                int currentDfc2 = dfc2Obj is int i ? i : (dfc2Obj is long l ? (int)l : 0);
+
+                if ((currentDfc2 & 1) == 0)
+                {
+                    if (key.GetValue(Dfc2BackupValueName) == null)
+                        key.SetValue(Dfc2BackupValueName, currentDfc2, RegistryValueKind.DWord);
+
+                    int newDfc2 = currentDfc2 | 1;
+                    key.SetValue(Dfc2ValueName, newDfc2, RegistryValueKind.DWord);
+                    ProbeLog.Line($"Enabled Intel Dynamic Refresh Rate (DRR) in driver ({Dfc2ValueName}: 0x{currentDfc2:X} -> 0x{newDfc2:X}).");
+                }
+                else
+                {
+                    ProbeLog.Line($"Intel {Dfc2ValueName} bit 0 is already set (0x{currentDfc2:X}).");
+                }
+
+                // 2. AlwaysInVrrMode DWORD = 1
+                object? vrrObj = key.GetValue(AlwaysInVrrModeValueName);
+                int currentVrr = vrrObj is int vi ? vi : (vrrObj != null ? 1 : 0);
+                if (vrrObj == null || currentVrr != 1)
+                {
+                    if (key.GetValue(AlwaysInVrrModeBackupValueName) == null)
+                        key.SetValue(AlwaysInVrrModeBackupValueName, vrrObj == null ? -1 : currentVrr, RegistryValueKind.DWord);
+
+                    key.SetValue(AlwaysInVrrModeValueName, 1, RegistryValueKind.DWord);
+                    ProbeLog.Line($"Enabled Intel VRR mode ({AlwaysInVrrModeValueName} = 1).");
+                }
+                else
+                {
+                    ProbeLog.Line($"Intel {AlwaysInVrrModeValueName} is already 1.");
+                }
+
+                // 3. EnableMstVrr DWORD = 1
+                object? mstObj = key.GetValue(EnableMstVrrValueName);
+                int currentMst = mstObj is int mi ? mi : (mstObj != null ? 1 : 0);
+                if (mstObj == null || currentMst != 1)
+                {
+                    if (key.GetValue(EnableMstVrrBackupValueName) == null)
+                        key.SetValue(EnableMstVrrBackupValueName, mstObj == null ? -1 : currentMst, RegistryValueKind.DWord);
+
+                    key.SetValue(EnableMstVrrValueName, 1, RegistryValueKind.DWord);
+                    ProbeLog.Line($"Enabled Intel MST VRR pipeline ({EnableMstVrrValueName} = 1).");
+                }
+                else
+                {
+                    ProbeLog.Line($"Intel {EnableMstVrrValueName} is already 1.");
+                }
+            }
+            catch (Exception ex)
+            {
+                ProbeLog.Line($"Failed to configure DRR at {keyPath}: {ex.Message}");
+            }
+        }
+    }
+
+    internal static void RestoreIntelDrr()
+    {
+        var keys = FindIntelDriverClassKeys();
+        foreach (string keyPath in keys)
+        {
+            try
+            {
+                using RegistryKey? key = Registry.LocalMachine.OpenSubKey(keyPath, writable: true);
+                if (key == null)
+                    continue;
+
+                // 1. DisplayFeatureControl2
+                object? backupObj = key.GetValue(Dfc2BackupValueName);
+                if (backupObj is int backupVal)
+                {
+                    key.SetValue(Dfc2ValueName, backupVal, RegistryValueKind.DWord);
+                    key.DeleteValue(Dfc2BackupValueName, throwOnMissingValue: false);
+                    ProbeLog.Line($"Restored Intel {Dfc2ValueName} to 0x{backupVal:X}.");
+                }
+                else
+                {
+                    object? valObj = key.GetValue(Dfc2ValueName);
+                    if (valObj is int currentVal && (currentVal & 1) != 0)
+                    {
+                        int restored = currentVal & ~1;
+                        key.SetValue(Dfc2ValueName, restored, RegistryValueKind.DWord);
+                        ProbeLog.Line($"Restored Intel {Dfc2ValueName} (0x{currentVal:X} -> 0x{restored:X}).");
+                    }
+                }
+
+                // 2. AlwaysInVrrMode
+                object? vrrBackupObj = key.GetValue(AlwaysInVrrModeBackupValueName);
+                if (vrrBackupObj is int vrrBackupVal)
+                {
+                    if (vrrBackupVal == -1)
+                        key.DeleteValue(AlwaysInVrrModeValueName, throwOnMissingValue: false);
+                    else
+                        key.SetValue(AlwaysInVrrModeValueName, vrrBackupVal, RegistryValueKind.DWord);
+                    key.DeleteValue(AlwaysInVrrModeBackupValueName, throwOnMissingValue: false);
+                    ProbeLog.Line($"Restored Intel {AlwaysInVrrModeValueName}.");
+                }
+                else
+                {
+                    key.DeleteValue(AlwaysInVrrModeValueName, throwOnMissingValue: false);
+                }
+
+                // 3. EnableMstVrr
+                object? mstBackupObj = key.GetValue(EnableMstVrrBackupValueName);
+                if (mstBackupObj is int mstBackupVal)
+                {
+                    if (mstBackupVal == -1)
+                        key.DeleteValue(EnableMstVrrValueName, throwOnMissingValue: false);
+                    else
+                        key.SetValue(EnableMstVrrValueName, mstBackupVal, RegistryValueKind.DWord);
+                    key.DeleteValue(EnableMstVrrBackupValueName, throwOnMissingValue: false);
+                    ProbeLog.Line($"Restored Intel {EnableMstVrrValueName}.");
+                }
+                else
+                {
+                    key.DeleteValue(EnableMstVrrValueName, throwOnMissingValue: false);
+                }
+            }
+            catch (Exception ex)
+            {
+                ProbeLog.Line($"Failed to restore DRR at {keyPath}: {ex.Message}");
+            }
+        }
+    }
 
     private static byte[] ReadEdidAt(string path)
     {
@@ -914,26 +1153,66 @@ internal sealed class CcdSignal
     private static bool IsInternalTechnology(uint tech)
         => tech is 0x80000000u or 10u or 6u;
 
-    private static bool TryQueryActiveConfig(out Native.PathInfo[] paths, out Native.ModeInfo[] modes, out uint pathCount, out uint modeCount)
+    internal static bool TryQueryActiveConfig(out Native.PathInfo[] paths, out Native.ModeInfo[] modes, out uint pathCount, out uint modeCount)
     {
         paths = Array.Empty<Native.PathInfo>();
         modes = Array.Empty<Native.ModeInfo>();
         pathCount = 0;
         modeCount = 0;
 
+        uint flags = Native.QdcOnlyActivePaths | Native.QdcVirtualRefreshRateAware;
         for (int attempt = 0; attempt < 3; attempt++)
         {
-            if (Native.GetDisplayConfigBufferSizes(Native.QdcOnlyActivePaths, out pathCount, out modeCount) != 0)
-                return false;
+            if (Native.GetDisplayConfigBufferSizes(flags, out pathCount, out modeCount) != 0)
+            {
+                flags = Native.QdcOnlyActivePaths;
+                if (Native.GetDisplayConfigBufferSizes(flags, out pathCount, out modeCount) != 0)
+                    return false;
+            }
             paths = new Native.PathInfo[pathCount];
             modes = new Native.ModeInfo[modeCount];
-            int rc = Native.QueryDisplayConfig(Native.QdcOnlyActivePaths, ref pathCount, paths, ref modeCount, modes, IntPtr.Zero);
+            int rc = Native.QueryDisplayConfig(flags, ref pathCount, paths, ref modeCount, modes, IntPtr.Zero);
             if (rc == 0)
                 return true;
             if (rc != 122) // ERROR_INSUFFICIENT_BUFFER
                 return false;
         }
         return false;
+    }
+
+    internal static bool TryEnableDrrViaCcd()
+    {
+        try
+        {
+            if (!TryQueryActiveConfig(out var paths, out var modes, out uint pathCount, out uint modeCount) || pathCount == 0)
+                return false;
+
+            ref var p = ref paths[0];
+            if ((p.flags & Native.DisplayConfigPathBoostRefreshRate) != 0)
+            {
+                ProbeLog.Line("Dynamic Refresh Rate (DRR) is already active on the display path.");
+                return true;
+            }
+
+            p.flags |= Native.DisplayConfigPathBoostRefreshRate;
+            uint setFlags = Native.SdcApply | Native.SdcUseSuppliedDisplayConfig | Native.SdcAllowChanges | Native.SdcVirtualRefreshRateAware;
+            int rc = Native.SetDisplayConfig(pathCount, paths, modeCount, modes, setFlags);
+            if (rc == 0)
+            {
+                ProbeLog.Line("Engaged Dynamic Refresh Rate (DRR) in Windows Display Manager via CCD.");
+                return true;
+            }
+            else
+            {
+                ProbeLog.Line($"CCD SetDisplayConfig for DRR returned {rc}.");
+                return false;
+            }
+        }
+        catch (Exception ex)
+        {
+            ProbeLog.Line($"CCD DRR activation encountered error: {ex.Message}");
+            return false;
+        }
     }
 }
 
@@ -1202,7 +1481,7 @@ internal sealed class PanelEdid
         {
             byte[]? block = others.FirstOrDefault(item => item[0] == tag);
             if (block != null)
-                primary.Add(block);
+                primary.Add(PatchDisplayIdBlock(block, preferred));
         }
         Take(0x20);
         Take(0x21);
@@ -1213,7 +1492,7 @@ internal sealed class PanelEdid
         foreach (byte[] block in others)
         {
             if (block[0] is not (0x20 or 0x21 or 0x26 or 0x81 or 0x2B))
-                primary.Add(block);
+                primary.Add(PatchDisplayIdBlock(block, preferred));
         }
 
         var chunks = new List<byte[][]>();
@@ -1228,6 +1507,21 @@ internal sealed class PanelEdid
         block0 = new byte[128];
         Buffer.BlockCopy(sourceEdid, 0, block0, 0, 128);
         block0[126] = (byte)(1 + chunks.Count);
+
+        // Intel Arrow Lake-H driver (igdkmdn64.sys) uses an internal panel whitelist table
+        // at RVA 0x8C1E90 to enable VRR/DRR capabilities. Samsung 240Hz OLED panels
+        // are whitelisted under entry 102 as SDC4179 (Manufacturer 0x4C, 0x83; Product 0x79, 0x41)
+        // with VRR range 60 Hz - 240 Hz. SDC41AB is the exact same panel revision, but because its
+        // Product Code is 0x41AB, Intel driver fails the whitelist check and reports "Supported by driver"
+        // without any VRR range to Windows DWM, preventing Dynamic Refresh Rate (DRR) from activating.
+        // Spoofing Product Code 0x79, 0x41 (SDC4179) allows the driver to match entry 102 and enables DRR.
+        // Descriptors 0 and 2 remain clean (zeros) as in stock EDID to avoid invalid scaled-clock modes.
+        if (sourceEdid.Length >= 12 && sourceEdid[8] == 0x4C && sourceEdid[9] == 0x83)
+        {
+            block0[10] = 0x79;
+            block0[11] = 0x41;
+        }
+
         block0[127] = BlockChecksum(block0, 0);
         if (!EdidChecksumValid(block0) || !EdidChecksumValid(block1) || !DisplayIdChecksumValid(block1))
             throw new InvalidOperationException("EDID override checksum failed.");
@@ -1236,6 +1530,53 @@ internal sealed class PanelEdid
             if (!EdidChecksumValid(extra) || !DisplayIdChecksumValid(extra))
                 throw new InvalidOperationException("EDID override checksum failed.");
         }
+    }
+
+    private static byte[] PatchDisplayIdBlock(byte[] block, IReadOnlyList<byte[]> preferred)
+    {
+        if (block.Length < 3)
+            return block;
+
+        // Tag 0x20 is DisplayID Product Identification Data Block
+        // Patch Product Code to 0x79, 0x41 (SDC4179) if vendor is SDC ("\xBA\x41\x59")
+        if (block[0] == 0x20 && block.Length >= 8)
+        {
+            if (block[3] == 0xBA && block[4] == 0x41 && block[5] == 0x59)
+            {
+                byte[] patched = (byte[])block.Clone();
+                patched[6] = 0x79;
+                patched[7] = 0x41;
+                return patched;
+            }
+        }
+
+        // Block 0x2B is the DisplayID Adaptive-Sync Data Block
+        if (block[0] == 0x2B && block.Length >= 8)
+        {
+            int payloadLen = block[2];
+            if (payloadLen >= 6)
+            {
+                int nativeHz = 240;
+                if (preferred.Count > 0 && preferred[0].Length >= 20)
+                {
+                    Decode(preferred[0], out int clk, out int ha, out int hb, out _, out _, out _, out int va, out int vb, out _, out _, out _, out _);
+                    int hTot = ha + hb;
+                    int vTot = va + vb;
+                    if (hTot > 0 && vTot > 0)
+                        nativeHz = (int)Math.Round((clk * 1000.0) / (hTot * (double)vTot));
+                }
+
+                // Byte 5 is min rate (0x3C = 60 Hz). Panel hardware & Intel whitelist min rate is 60 Hz.
+                // Byte 6 is max rate low byte (e.g. 0xEF = 239 Hz). Native rate is 240 Hz (0xF0).
+                // Byte 7 is max rate high bits [1:0]
+                byte[] patched = (byte[])block.Clone();
+                patched[5] = 0x3C; // 60 Hz min rate (panel native & Intel whitelist min rate)
+                patched[6] = (byte)(nativeHz & 0xFF);
+                patched[7] = (byte)((patched[7] & ~0x03) | ((nativeHz >> 8) & 0x03));
+                return patched;
+            }
+        }
+        return block;
     }
 
     private static void CollectDisplayId(byte[] edid, List<byte[]> timings, List<byte[]> others)
@@ -1470,10 +1811,16 @@ internal static class Native
 {
     public const int EnumCurrentSettings = -1;
     public const uint QdcOnlyActivePaths = 2;
+    public const uint QdcVirtualRefreshRateAware = 0x40;
     public const int ModeInfoTypeTarget = 2;
     public const int DeviceInfoGetSourceName = 1;
     public const int DeviceInfoGetTargetName = 2;
     public const uint CmLocateDevnodePhantom = 1;
+    public const uint SdcApply = 0x00000080;
+    public const uint SdcUseSuppliedDisplayConfig = 0x00000020;
+    public const uint SdcAllowChanges = 0x00000400;
+    public const uint SdcVirtualRefreshRateAware = 0x00020000;
+    public const uint DisplayConfigPathBoostRefreshRate = 0x00000010;
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     public struct DisplayDevice
@@ -1702,4 +2049,12 @@ internal static class Native
 
     [DllImport("user32.dll")]
     public static extern int DisplayConfigGetDeviceInfo(ref TargetDeviceName requestPacket);
+
+    [DllImport("user32.dll")]
+    public static extern int SetDisplayConfig(
+        uint numPathArrayElements,
+        [In] PathInfo[] pathArray,
+        uint numModeInfoArrayElements,
+        [In] ModeInfo[] modeInfoArray,
+        uint flags);
 }

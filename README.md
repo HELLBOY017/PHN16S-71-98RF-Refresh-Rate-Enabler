@@ -1,8 +1,8 @@
 # PHN16S-71-98RF Refresh Rate Enabler
 
-Adds 60, 75, 100, 120, 144, and 165 Hz on the Acer Predator Helios Neo 16S (PHN16S-71-98RF).
+Adds 60, 75, 100, 120, 144, and 165 Hz and enables Dynamic Refresh Rate (DRR) on the Acer Predator Helios Neo 16S (PHN16S-71-98RF).
 
-On the Intel GPU, Windows lists every mode: 240 Hz, 165.02 Hz, 144 Hz, 120 Hz, 100.01 Hz, 75 Hz, and 60 Hz.
+On the Intel GPU, Windows lists every mode: 240 Hz, 165.02 Hz, 144 Hz, 120 Hz, 100.01 Hz, 75 Hz, and 60 Hz, with Dynamic Refresh Rate (DRR) support.
 
 ![Every refresh rate on the Intel GPU](pics/Screenshot%202026-10-22%20201044.png)
 
@@ -53,15 +53,21 @@ At 60 Hz, brightness can flicker a little because of the panel's PWM dimming. Wi
 
 ![NVIDIA at 60 Hz](pics/Screenshot%202026-10-22%20194718.png)
 
-120 Hz. The desktop mode and the active signal are both 120 Hz. Variable refresh rate covers 48–120 Hz, and Dynamic refresh rate can be turned on.
+120 Hz. The desktop mode and the active signal are both 120 Hz. Variable refresh rate covers 60–120 Hz, and Dynamic refresh rate can be turned on.
 
 ![NVIDIA at 120 Hz](pics/Screenshot%202026-10-22%20194724.png)
 
-165 Hz. The desktop mode and the active signal are both 165 Hz. Variable refresh rate covers 48–165 Hz, and Dynamic refresh rate can be turned on.
+165 Hz. The desktop mode and the active signal are both 165 Hz. Variable refresh rate covers 60–165 Hz, and Dynamic refresh rate can be turned on.
 
 ![NVIDIA at 165 Hz](pics/Screenshot%202026-10-22%20194741.png)
 
 ## Intel
+
+Dynamic Refresh Rate (DRR) and Variable Refresh Rate (VRR) are supported on the Intel GPU. The enabler configures the Intel graphics driver registry key (`DisplayFeatureControl2` bit 0, `AlwaysInVrrMode` = 1, `EnableMstVrr` = 1), spoofs the panel Product Code to `SDC4179` in EDID Block 0 and DisplayID 2.0 Tag 0x20 to match the Intel driver's internal panel whitelist table, and patches the DisplayID 2.0 Adaptive-Sync data block (0x2B) to declare 60–240 Hz.
+
+When staged, Windows 11 offers:
+- **Dynamic (60 Hz or 120 Hz)** / Dynamic refresh rate options in Windows Display Settings.
+- Seamless refresh rate switching between 60, 75, 100, 120, 144, 165, and 240 Hz without screen relink or black screens.
 
 60 Hz. The desktop mode and the active signal are both 2560×1600 at 60 Hz. Variable refresh rate is supported by the driver.
 

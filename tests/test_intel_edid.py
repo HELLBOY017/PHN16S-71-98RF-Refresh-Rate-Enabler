@@ -1,6 +1,8 @@
 """Exercise early-boot selection without accessing the machine's DRM settings."""
 import importlib.util
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -10,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 HOOK = ROOT / 'linux/dracut/91preysense-edid/intel-edid.sh'
 
 class IntelEdidTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('sh') is not None, "sh is required")
     def test_only_intel_primary_uses_override(self):
         functions = HOOK.read_text().rsplit('preysense_select_edid', 1)[0]
         for owner in ('intel', 'nvidia', None):
@@ -30,6 +33,7 @@ class IntelEdidTests(unittest.TestCase):
         uninstall.assert_called_once()
         detect.assert_not_called()
 
+    @unittest.skipUnless(hasattr(os, 'geteuid'), "POSIX geteuid required")
     def test_reject_nvidia_connector_before_installing(self):
         spec=importlib.util.spec_from_file_location('enabler',ROOT/'phn16s_refresh_enabler.py')
         module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
@@ -37,4 +41,30 @@ class IntelEdidTests(unittest.TestCase):
             with self.assertRaises(ValueError):module.install_override(b'', ['eDP-2'])
         mkdir.assert_not_called()
 
-if __name__ == '__main__':unittest.main()
+    def test_adaptive_sync_block_patched_to_240(self):
+        spec=importlib.util.spec_from_file_location('enabler',ROOT/'phn16s_refresh_enabler.py')
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        source = (
+            b'\x00\xff\xff\xff\xff\xff\xff\x00L\x83\xabA\x00\x00\x00\x00\x00!\x01\x04\xb5"\x16x\x03\x0c\xf1\xaeR<\xb9#\x0cPT\x00\x00\x00\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xfd\x0c0\xf0\xab\xabq\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xfe\x00ATNA60DL03-0 \x01\xfep y\x02\x00 \x00\x0c\xbaAY\xabA\x00\x00\x00\x00\x00\x17\x00!\x00\x1dt\ri\x08\x00\n@\x06\x00\xe1\xfaQ\xcb\x13\xb9=\xd2\x0c\x01ET@^\xd0`\x18\x10#x&\x00\t\x04\x00\x00\x00\x00\x00P\x00\x00"\x00\x14\x9a+\x11\x85\xff\tO\x00\x07\x00\x1f\x00?\x06\xaf\x00\x9d\x00\x07\x00\x81\x00\x0b\xe3\x05\x80\x00\xe6\x06\x05\x01t`\x02+\x00\x06\'\x00<\xef\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xf1\x90'
+        )
+        overridden = module.generate_overridden_edid(source)
+        timings, others = module.collect_display_id(overridden)
+        found_adaptive = False
+        found_tag20 = False
+        for o in others:
+            if o[0] == 0x2B:
+                found_adaptive = True
+                self.assertEqual(o[5], 0x3C)  # 60 Hz min rate (panel native & Intel whitelist min rate)
+                self.assertEqual(o[6], 0xF0)  # 240 Hz max rate
+            elif o[0] == 0x20:
+                found_tag20 = True
+                self.assertEqual(o[6:8], b'\x79\x41')  # SDC4179 product code in DisplayID
+        self.assertTrue(found_adaptive)
+        self.assertTrue(found_tag20)
+        # Check Block 0 Product Code spoofed to SDC4179 to match Intel driver whitelist table (entry 102)
+        self.assertEqual(overridden[8:10], b'\x4c\x83')
+        self.assertEqual(overridden[10:12], b'\x79\x41')
+        # Check Block 0 descriptors 0 and 2 remain zero (no invalid scaled pixel-clock modes)
+        self.assertEqual(overridden[54:72], b'\x00' * 18)
+        self.assertEqual(overridden[90:108], b'\x00' * 18)
+        self.assertEqual(module.block_checksum(overridden[:128], 0), overridden[127])

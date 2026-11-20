@@ -184,12 +184,27 @@ def generate_overridden_edid(source_edid, target_rates=STAGED_RATES):
             if o[0] == tag:
                 primary.append(o)
                 break
-    take(0x20)
+    for o in others:
+        if o[0] == 0x20:
+            b = bytearray(o)
+            if len(b) >= 8 and b[3:6] == b"\xba\x41\x59":
+                b[6] = 0x79
+                b[7] = 0x41
+            primary.append(bytes(b))
+            break
     take(0x21)
     take(0x26)
     primary.append(type_vii_block(timings))
     take(0x81)
-    take(0x2B)
+    for o in others:
+        if o[0] == 0x2B:
+            b = bytearray(o)
+            if len(b) >= 8:
+                b[5] = 0x3C  # 60 Hz min rate (panel native & Intel whitelist min rate)
+                b[6] = 0xF0  # 240 Hz max rate
+                b[7] &= ~0x03
+            primary.append(bytes(b))
+            break
     for o in others:
         if o[0] not in (0x20, 0x21, 0x26, 0x81, 0x2B):
             primary.append(o)
@@ -203,6 +218,17 @@ def generate_overridden_edid(source_edid, target_rates=STAGED_RATES):
     extras = [build_extension(chunks[i], len(chunks) - 1 - i) for i in range(len(chunks))]
     block0 = bytearray(source_edid[:128])
     block0[126] = 1 + len(chunks)
+    # Intel Arrow Lake-H driver (igdkmdn64.sys) uses an internal panel whitelist table
+    # at RVA 0x8C1E90 to enable VRR/DRR capabilities. Samsung 240Hz OLED panels
+    # are whitelisted under entry 102 as SDC4179 (Manufacturer 0x4C, 0x83; Product 0x79, 0x41)
+    # with VRR range 60 Hz - 240 Hz. SDC41AB is the exact same panel revision, but because its
+    # Product Code is 0x41AB, Intel driver fails the whitelist check and reports "Supported by driver"
+    # without any VRR range to Windows DWM, preventing Dynamic Refresh Rate (DRR) from activating.
+    # Spoofing Product Code 0x79, 0x41 (SDC4179) allows the driver to match entry 102 and enables DRR.
+    # Descriptors 0 and 2 remain clean (zeros) as in stock EDID to avoid invalid scaled-clock modes.
+    if len(block0) >= 12 and block0[8:10] == b"\x4c\x83":
+        block0[10] = 0x79
+        block0[11] = 0x41
     block0[127] = block_checksum(block0, 0)
 
     result = bytearray()
