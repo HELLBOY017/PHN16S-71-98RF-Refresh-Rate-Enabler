@@ -56,6 +56,7 @@ public sealed class MainWindow : Window
         var root = new DockPanel { Margin = new Thickness(20) };
         var buttons = new WrapPanel { Margin = new Thickness(0, 8, 0, 0) };
         buttons.Children.Add(MakeButton("Add refresh rates", StageClick, primary: true));
+        buttons.Children.Add(MakeButton("Restore HDR certification", RestoreHdrClick, primary: false));
         buttons.Children.Add(MakeButton("Restart driver", RestartClick, primary: false));
         buttons.Children.Add(MakeButton("Remove override", RevertClick, primary: false));
         buttons.Children.Add(MakeButton("Refresh", (_, _) => Load(clearLog: true), primary: false));
@@ -89,11 +90,13 @@ public sealed class MainWindow : Window
         header.Children.Add(StepBody("Switch to either the Intel or NVIDIA GPU, whichever you want to set up first."));
         header.Children.Add(StepTitle("2 — Add refresh rates"));
         header.Children.Add(StepBody("Click Add refresh rates to add 60, 75, 100, 120, 144, and 165 Hz."));
-        header.Children.Add(StepTitle("3 — Apply the changes"));
+        header.Children.Add(StepTitle("3 — Restore HDR certification (optional)"));
+        header.Children.Add(StepBody("Click Restore HDR certification to restore the official VESA DisplayHDR True Black 500 certification badge on both Intel and NVIDIA."));
+        header.Children.Add(StepTitle("4 — Apply the changes"));
         header.Children.Add(_step3);
-        header.Children.Add(StepTitle("4 — Repeat for the other GPU"));
+        header.Children.Add(StepTitle("5 — Repeat for the other GPU"));
         header.Children.Add(StepBody("Switch to the other GPU, then click Refresh. Click Add refresh rates again. On Intel, click Restart driver again."));
-        header.Children.Add(StepTitle("5 — Choose a refresh rate"));
+        header.Children.Add(StepTitle("6 — Choose a refresh rate"));
         header.Children.Add(StepBody("Open Windows Settings → System → Display → Advanced display. Choose a refresh rate, and confirm if Windows asks."));
         header.Children.Add(MoreInfo());
         header.Children.Add(_summary);
@@ -244,6 +247,30 @@ public sealed class MainWindow : Window
                     return;
                 }
                 _nextStep.Text = "Refresh rates saved for " + gpu + ". Click Restart driver to apply them. The screen may briefly turn black.";
+                _nextStep.Visibility = Visibility.Visible;
+            });
+        });
+    }
+
+    private void RestoreHdrClick(object sender, RoutedEventArgs e)
+    {
+        string gpu = _monitor != null ? Program.ActiveGpu(_monitor) : "current GPU";
+        string action = "Restore official VESA DisplayHDR True Black 500 certification for " + gpu + "?\n\nWindows Display Settings will recognize the panel's certified True Black 500 HDR level.";
+        if (MessageBox.Show(this, action, "Restore HDR certification", MessageBoxButton.OKCancel, MessageBoxImage.Information) != MessageBoxResult.OK)
+            return;
+
+        MonitorInfo? monitor = _monitor;
+        RunWork(() =>
+        {
+            int result = Program.RestoreHdrCertification(monitor);
+            Dispatcher.Invoke(() =>
+            {
+                if (result != 0)
+                {
+                    _nextStep.Visibility = Visibility.Collapsed;
+                    return;
+                }
+                _nextStep.Text = "VESA DisplayHDR True Black 500 restored for " + gpu + ". Click Restart driver or reopen Windows Display Settings to view the badge.";
                 _nextStep.Visibility = Visibility.Visible;
             });
         });

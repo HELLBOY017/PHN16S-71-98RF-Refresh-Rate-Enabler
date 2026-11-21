@@ -20,17 +20,29 @@ Switch to the either the Intel or NVIDIA GPU, whichever you want to set up first
 
 Click **Add refresh rates**. This adds 60, 75, 100, 120, 144, and 165 Hz.
 
-**3 — Apply the changes**
+**3 — Restore HDR certification (optional)**
+
+Click **Restore HDR certification** to restore the official **VESA DisplayHDR True Black 500** certification badge in Windows Display Settings on both Intel and NVIDIA.
+
+**4 — Apply the changes**
 
 Click **Restart driver**. The screen may briefly turn black.
 
-**4 — Repeat for the other GPU**
+**5 — Repeat for the other GPU**
 
-Switch to the other GPU, then click **Refresh**. Click **Add refresh rates** again, and click **Restart driver** again.
+Switch to the other GPU, then click **Refresh**. Click **Add refresh rates** again (and **Restore HDR certification**), and click **Restart driver** again.
 
-**5 — Choose a refresh rate**
+**6 — Choose a refresh rate**
 
 Open **Windows Settings → System → Display → Advanced display**. Choose a refresh rate, and confirm if Windows asks.
+
+### Command-line options
+
+- `--stage`: stage the refresh rates (60, 75, 100, 120, 144, 165 Hz)
+- `--restore-hdr`: restore VESA DisplayHDR True Black 500 certification
+- `--restart`: restart the active display driver
+- `--revert`: remove the Intel refresh rate override
+- `--force`: replace an existing override
 
 
 ## Troubleshooting

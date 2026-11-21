@@ -4,6 +4,7 @@ dist/
 .vs/
 *.user
 *.exe
+*.old
 
 __pycache__/
 *.pyc
