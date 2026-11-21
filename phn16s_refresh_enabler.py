@@ -179,10 +179,23 @@ def generate_overridden_edid(source_edid, target_rates=STAGED_RATES):
         print(f"  + {hz} Hz -> actual {actual_hz:.2f} Hz, vTotal={v_total}, vBlank={v_blank}, vFront={v_front}")
 
     primary = []
+    def patch_block(o):
+        if o[0] == 0x20 and len(o) >= 8 and o[3:6] == b'\xba\x41\x59':
+            patched = bytearray(o)
+            patched[6:8] = b'\x0a\x10'
+            return bytes(patched)
+        if o[0] == 0x2B and len(o) >= 8:
+            patched = bytearray(o)
+            patched[5] = 0x30  # 48 Hz min rate to match Block 0 descriptor 0xFD and Intel whitelist entry 94
+            patched[6] = 0xF0  # 240 Hz max rate low byte
+            patched[7] = (patched[7] & ~0x03)
+            return bytes(patched)
+        return o
+
     def take(tag):
         for o in others:
             if o[0] == tag:
-                primary.append(o)
+                primary.append(patch_block(o))
                 break
     take(0x20)
     take(0x21)
@@ -192,7 +205,7 @@ def generate_overridden_edid(source_edid, target_rates=STAGED_RATES):
     take(0x2B)
     for o in others:
         if o[0] not in (0x20, 0x21, 0x26, 0x81, 0x2B):
-            primary.append(o)
+            primary.append(patch_block(o))
 
     chunks = []
     for i in range(0, len(added), 5):
@@ -203,6 +216,18 @@ def generate_overridden_edid(source_edid, target_rates=STAGED_RATES):
     extras = [build_extension(chunks[i], len(chunks) - 1 - i) for i in range(len(chunks))]
     block0 = bytearray(source_edid[:128])
     block0[126] = 1 + len(chunks)
+    # Intel Arrow Lake-H driver (igdkmdn64.sys) uses a display whitelist table
+    # to enable VRR/DRR capabilities. Samsung 240Hz displays are whitelisted under
+    # entry 94 as SAM 0x100A (Manufacturer 0x4C, 0x2D; Product 0x0A, 0x10) with a
+    # 48 Hz - 240 Hz VRR range, matching our Samsung panel's native 48-240 Hz capabilities.
+    # Spoofing Manufacturer SAM (0x4C, 0x2D) and Product Code 0x100A (0x0A, 0x10) allows the
+    # driver to match entry 94 and enables full 48 Hz - 240 Hz Dynamic Refresh Rate (DRR).
+    # Descriptors 0 and 2 remain clean (zeros) as in stock EDID to avoid invalid scaled-clock modes.
+    if len(block0) >= 12 and block0[8] == 0x4c and block0[9] in (0x83, 0x2d):
+        block0[8] = 0x4c
+        block0[9] = 0x2d
+        block0[10] = 0x0a
+        block0[11] = 0x10
     block0[127] = block_checksum(block0, 0)
 
     result = bytearray()
