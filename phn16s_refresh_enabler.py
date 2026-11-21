@@ -114,26 +114,24 @@ def finish_section(blocks, product_type, extension_count):
     sec = bytearray(128)
     sec[0] = 0x70
     sec[1] = 0x20
-    sec[2] = length
+    sec[2] = 121  # VESA DisplayID 2.0 in EDID extension block must have section length 121 (0x79)
     sec[3] = product_type
     sec[4] = extension_count
     offset = 5
     for b in blocks:
         sec[offset : offset + len(b)] = b
         offset += len(b)
-    checksum_at = length + 5
-    s = sum(sec[1:checksum_at]) & 0xFF
-    sec[checksum_at] = (256 - s) & 0xFF
+    s = sum(sec[1:126]) & 0xFF
+    sec[126] = (256 - s) & 0xFF
     sec[127] = block_checksum(sec, 0)
     return sec
 
 
 def build_extension(descriptors, following=0):
-    payload = 3 + 20 * len(descriptors)
     b = bytearray(128)
     b[0] = 0x70
     b[1] = 0x20
-    b[2] = payload
+    b[2] = 121  # VESA DisplayID 2.0 in EDID extension block must have section length 121 (0x79)
     b[3] = 0x00
     b[4] = following
     b[5] = 0x22
@@ -143,9 +141,8 @@ def build_extension(descriptors, following=0):
     for d in descriptors:
         b[offset : offset + 20] = d
         offset += 20
-    checksum_at = payload + 5
-    s = sum(b[1:checksum_at]) & 0xFF
-    b[checksum_at] = (256 - s) & 0xFF
+    s = sum(b[1:126]) & 0xFF
+    b[126] = (256 - s) & 0xFF
     b[127] = block_checksum(b, 0)
     return b
 

@@ -22,12 +22,11 @@ Click **Add refresh rates**. This adds 60, 75, 100, 120, 144, and 165 Hz.
 
 **3 — Apply the changes**
 
-- **Intel GPU:** Click **Restart driver**. The screen may briefly turn black.
-- **NVIDIA GPU:** The rates are added through the NVIDIA driver. A driver restart is normally unnecessary.
+Click **Restart driver**. The screen may briefly turn black.
 
 **4 — Repeat for the other GPU**
 
-Switch to the other GPU, then click **Refresh**. Click **Add refresh rates** again. On Intel, click **Restart driver** again.
+Switch to the other GPU, then click **Refresh**. Click **Add refresh rates** again, and click **Restart driver** again.
 
 **5 — Choose a refresh rate**
 
@@ -38,12 +37,11 @@ Open **Windows Settings → System → Display → Advanced display**. Choose a 
 
 **Screen stays black?**
 
-Press **F8 within 15 seconds** of restarting the driver. That restores 240 Hz for this session. The saved Intel rates remain, so you can restart the driver again later.
+Press **F8 within 15 seconds** of restarting the driver. That restores 240 Hz for this session. The saved rates remain, so you can restart the driver again later.
 
 **Want to undo the changes?**
 
-- **Intel:** Switch to the Intel GPU, click **Remove override**, then **Restart driver**.
-- **NVIDIA:** Clean install the driver from the NVIDIA app.
+Click **Remove override**, then **Restart driver**.
 
 At 60 Hz, brightness can flicker a little because of the panel's PWM dimming. Windows may show **165.02 Hz** instead of 165 Hz. That is expected.
 

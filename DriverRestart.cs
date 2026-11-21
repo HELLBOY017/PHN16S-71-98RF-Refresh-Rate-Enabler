@@ -4,6 +4,8 @@ internal static class DriverRestart
 {
     private const uint DigcfPresent = 0x02;
     private const uint DifPropertyChange = 0x12;
+    private const int DicsEnable = 0x1;
+    private const int DicsDisable = 0x2;
     private const int DicsPropChange = 0x3;
     private const int DicsFlagConfigSpecific = 0x2;
     private const uint SpdrpDeviceDesc = 0;
@@ -37,7 +39,8 @@ internal static class DriverRestart
 
         try
         {
-            string first = RestartDisplayAdapters();
+            string first = RestartDisplayAdapters(monitor);
+            WakeDisplays();
             bool pressed = f8.WaitOne(TimeSpan.FromSeconds(15));
             if (!pressed)
                 return first;
@@ -47,7 +50,8 @@ internal static class DriverRestart
                 return first + " F8 was pressed. No override was installed, so nothing was unloaded.";
 
             Program.DeleteOverrides(monitor);
-            string second = RestartDisplayAdapters();
+            string second = RestartDisplayAdapters(monitor);
+            WakeDisplays();
             Program.RestoreOverrides(saved);
             return second + " F8 unloaded the override and brought the native panel timing back. The override is still saved; restart the driver again to load it.";
         }
@@ -154,13 +158,14 @@ internal static class DriverRestart
         return hasDiscrete && !hasIntegrated;
     }
 
-    private static string RestartDisplayAdapters()
+    private static string RestartDisplayAdapters(MonitorInfo? monitor = null)
     {
         Guid displayClass = new("4d36e968-e325-11ce-bfc1-08002be10318");
         IntPtr set = SetupDiGetClassDevs(ref displayClass, null, IntPtr.Zero, DigcfPresent);
         if (set == IntPtr.Zero || set == new IntPtr(-1))
             return "Could not list display adapters.";
 
+        string? targetGpu = monitor != null ? Program.ActiveGpu(monitor) : null;
         var restarted = new List<string>();
         var skipped = new List<string>();
         try
@@ -174,6 +179,23 @@ internal static class DriverRestart
                     skipped.Add(name);
                     info = new SpDevInfoData { cbSize = Marshal.SizeOf<SpDevInfoData>() };
                     continue;
+                }
+
+                if (targetGpu != null)
+                {
+                    string hwIds = ReadUnicodeProperty(set, ref info, SpdrpHardwareId);
+                    bool isNvidia = hwIds.Contains("VEN_10DE", StringComparison.OrdinalIgnoreCase) || name.Contains("NVIDIA", StringComparison.OrdinalIgnoreCase);
+                    bool isIntel = hwIds.Contains("VEN_8086", StringComparison.OrdinalIgnoreCase) || name.Contains("Intel", StringComparison.OrdinalIgnoreCase);
+                    if (targetGpu == "NVIDIA" && !isNvidia)
+                    {
+                        info = new SpDevInfoData { cbSize = Marshal.SizeOf<SpDevInfoData>() };
+                        continue;
+                    }
+                    if (targetGpu == "Intel" && !isIntel)
+                    {
+                        info = new SpDevInfoData { cbSize = Marshal.SizeOf<SpDevInfoData>() };
+                        continue;
+                    }
                 }
 
                 var change = new SpPropChangeParams
@@ -190,8 +212,21 @@ internal static class DriverRestart
 
                 bool queued = SetupDiSetClassInstallParams(set, ref info, ref change, Marshal.SizeOf<SpPropChangeParams>());
                 bool called = queued && SetupDiCallClassInstaller(DifPropertyChange, set, ref info);
-                if (called)
+
+                // If DicsPropChange left the device with an error, recover via DicsEnable
+                if (CM_Get_DevNode_Status(out uint status, out uint problem, info.DevInst, 0) == 0 && problem != 0)
+                {
+                    change.StateChange = DicsEnable;
+                    SetupDiSetClassInstallParams(set, ref info, ref change, Marshal.SizeOf<SpPropChangeParams>());
+                    SetupDiCallClassInstaller(DifPropertyChange, set, ref info);
+                    Thread.Sleep(500);
+                    CM_Get_DevNode_Status(out status, out problem, info.DevInst, 0);
+                }
+
+                if (called && problem == 0)
                     restarted.Add(name);
+                else if (called && problem != 0)
+                    restarted.Add(name + " (recovered)");
                 else
                     skipped.Add(name + " (error " + Marshal.GetLastWin32Error() + ")");
 
@@ -321,4 +356,20 @@ internal static class DriverRestart
 
     [DllImport("user32.dll")]
     private static extern bool PostThreadMessage(uint idThread, uint msg, IntPtr wParam, IntPtr lParam);
+
+    private static void WakeDisplays()
+    {
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "DisplaySwitch.exe",
+                Arguments = "/extend",
+                UseShellExecute = true,
+                CreateNoWindow = true
+            };
+            System.Diagnostics.Process.Start(psi);
+        }
+        catch { }
+    }
 }

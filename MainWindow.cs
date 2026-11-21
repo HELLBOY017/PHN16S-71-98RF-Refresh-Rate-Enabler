@@ -164,16 +164,19 @@ public sealed class MainWindow : Window
             _edid = _monitor.ReadEdid();
             _panel = PanelEdid.Parse(_edid);
             CcdSignal? signal = CcdSignal.ReadActive();
-            bool over = Program.IntelOverrideExists(_monitor);
+            bool over = Program.OverrideExists(_monitor);
             string gpu = Program.ActiveGpu(_monitor);
             ShowGpu(gpu);
             string modeList = _monitor.Modes.Count == 0 ? "none listed yet" : string.Join(", ", _monitor.Modes.Select(hz => hz + " Hz"));
+            string state = gpu == "NVIDIA"
+                ? (over ? "NVIDIA refresh rate override is enabled." : "NVIDIA refresh rates are not saved.")
+                : (over ? "Intel refresh rates are saved." : "Intel refresh rates are not saved.");
             _summary.Text =
                 _monitor.CurrentWidth + "×" + _monitor.CurrentHeight + " at " + _monitor.CurrentHz + " Hz"
                 + Environment.NewLine
                 + "Windows is offering: " + modeList
                 + Environment.NewLine
-                + (over ? "Intel refresh rates are saved." : "Intel refresh rates are not saved.");
+                + state;
 
             if (_panel.Error != null)
             {
@@ -221,9 +224,7 @@ public sealed class MainWindow : Window
         }
 
         string gpu = Program.ActiveGpu(_monitor);
-        string action = gpu == "NVIDIA"
-            ? "Add 60, 75, 100, 120, 144, and 165 Hz for the NVIDIA GPU? 240 Hz stays available."
-            : "Add 60, 75, 100, 120, 144, and 165 Hz for the Intel GPU? Click Restart driver afterward. The screen may briefly turn black. 240 Hz stays available.";
+        string action = "Add 60, 75, 100, 120, 144, and 165 Hz for " + gpu + "? Click Restart driver afterward. The screen may briefly turn black. 240 Hz stays available.";
         if (MessageBox.Show(this, action, "Add refresh rates", MessageBoxButton.OKCancel, MessageBoxImage.Warning) != MessageBoxResult.OK)
             return;
 
@@ -239,9 +240,7 @@ public sealed class MainWindow : Window
                     _nextStep.Visibility = Visibility.Collapsed;
                     return;
                 }
-                _nextStep.Text = gpu == "NVIDIA"
-                    ? "Refresh rates added. Open Windows Settings → System → Display → Advanced display and choose a rate. A driver restart is normally unnecessary."
-                    : "Refresh rates saved. Click Restart driver to apply them. The screen may briefly turn black.";
+                _nextStep.Text = "Refresh rates saved for " + gpu + ". Click Restart driver to apply them. The screen may briefly turn black.";
                 _nextStep.Visibility = Visibility.Visible;
             });
         });
@@ -251,13 +250,24 @@ public sealed class MainWindow : Window
     {
         if (_monitor == null)
             return;
-        string gpu = Program.ActiveGpu(_monitor);
-        string action = gpu == "NVIDIA"
-            ? "Remove override only removes Intel refresh rates. NVIDIA rates stay until you clean install the driver from the NVIDIA app."
-            : "Remove the Intel refresh rates? 240 Hz stays available. Click Restart driver afterward.";
+        string action = "Remove the refresh rate override? Click Restart driver afterward. The panel will return to its original 240 Hz mode.";
         if (MessageBox.Show(this, action, "Remove override", MessageBoxButton.OKCancel, MessageBoxImage.Warning) != MessageBoxResult.OK)
             return;
-        RunWork(() => Program.Revert(_monitor));
+        MonitorInfo monitor = _monitor;
+        RunWork(() =>
+        {
+            int result = Program.Revert(monitor);
+            Dispatcher.Invoke(() =>
+            {
+                if (result != 0)
+                {
+                    _nextStep.Visibility = Visibility.Collapsed;
+                    return;
+                }
+                _nextStep.Text = "Override removed. Click Restart driver to apply. The screen may briefly turn black.";
+                _nextStep.Visibility = Visibility.Visible;
+            });
+        });
     }
 
     private void RestartClick(object sender, RoutedEventArgs e)
@@ -303,9 +313,7 @@ public sealed class MainWindow : Window
         _gpuLine.Text = nvidia
             ? "NVIDIA GPU is driving this panel."
             : "Intel GPU is driving this panel.";
-        _step3.Text = nvidia
-            ? "The rates are added through the NVIDIA driver. A driver restart is normally unnecessary."
-            : "Click Restart driver to apply the new rates. The screen may briefly turn black.";
+        _step3.Text = "Click Restart driver to apply the new rates. The screen may briefly turn black.";
     }
 
     private static TextBlock StepTitle(string text)
