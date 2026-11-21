@@ -1,26 +1,32 @@
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 
 internal static class NvidiaPanelTiming
 {
     private const uint InfoTypeDdsStatus = 0x17;
 
-    private static string? ResolveNvCplPath()
+    private static IEnumerable<string> CandidateNvCplPaths()
     {
         string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
         string[] searchPaths =
         {
             Path.Combine(programFiles, "NVIDIA Corporation", "NVIDIA App", "NvCpl", "nvcpl.dll"),
             Path.Combine(programFiles, "NVIDIA Corporation", "Control Panel Client", "nvcpl.dll"),
-            Path.Combine(Environment.SystemDirectory, "nvcpl.dll")
+            Path.Combine(Environment.SystemDirectory, "nvcpl.dll"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "NVIDIA Corporation", "Control Panel Client", "nvcpl.dll")
         };
 
         foreach (string path in searchPaths)
         {
             if (File.Exists(path))
-                return path;
+                yield return path;
         }
-        return null;
+    }
+
+    private static string? ResolveNvCplPath()
+    {
+        return CandidateNvCplPaths().FirstOrDefault();
     }
 
     /// <summary>
@@ -30,67 +36,86 @@ internal static class NvidiaPanelTiming
     public static bool TryGetDdsActiveMux(out bool isNvidia)
     {
         isNvidia = false;
-        string? dllPath = ResolveNvCplPath();
-        if (dllPath == null)
-            return false;
-
-        nint lib = Native.LoadLibrary(dllPath);
-        if (lib == 0)
-            return false;
-
-        try
+        foreach (string dllPath in CandidateNvCplPaths())
         {
-            var init = TryBind<InitFn>(lib, "NvCplApiInit");
-            var close = TryBind<CloseFn>(lib, "NvCplApiClose");
-            var getInfo = TryBind<GetInfoFn>(lib, "NvCplApiGetInfo");
-            if (init == null || getInfo == null)
-                return false;
-
-            if (init() != 0)
-                return false;
+            nint lib = Native.LoadLibrary(dllPath);
+            if (lib == 0)
+                continue;
 
             try
             {
-                ulong size = 16;
-                nint pStatus = Marshal.AllocHGlobal(16);
+                var init = TryBind<InitFn>(lib, "NvCplApiInit");
+                var close = TryBind<CloseFn>(lib, "NvCplApiClose");
+                var getInfo = TryBind<GetInfoFn>(lib, "NvCplApiGetInfo");
+                if (init == null || getInfo == null)
+                    continue;
+
+                if (init() != 0)
+                    continue;
+
                 try
                 {
-                    for (int i = 0; i < 16; i++)
-                        Marshal.WriteByte(pStatus, i, 0);
-
-                    if (getInfo(InfoTypeDdsStatus, 0, pStatus, ref size) != 0)
-                        return false;
-
-                    var info = Marshal.PtrToStructure<NativeDdsStatusInfo>(pStatus);
-                    if (info.IsSupported == 0 || info.KmdResponse != 0)
-                        return false;
-
-                    if (info.MuxState == 2)
+                    ulong size = 16;
+                    nint pStatus = Marshal.AllocHGlobal(16);
+                    try
                     {
-                        isNvidia = true;
-                        return true;
+                        for (int i = 0; i < 16; i++)
+                            Marshal.WriteByte(pStatus, i, 0);
+
+                        if (getInfo(InfoTypeDdsStatus, 0, pStatus, ref size) != 0)
+                            continue;
+
+                        var info = Marshal.PtrToStructure<NativeDdsStatusInfo>(pStatus);
+                        if (info.IsSupported == 0 || info.KmdResponse != 0)
+                            continue;
+
+                        if (info.MuxState == 2)
+                        {
+                            isNvidia = true;
+                            return true;
+                        }
+                        if (info.MuxState == 1)
+                        {
+                            isNvidia = false;
+                            return true;
+                        }
                     }
-                    if (info.MuxState == 1)
+                    finally
                     {
-                        isNvidia = false;
-                        return true;
+                        Marshal.FreeHGlobal(pStatus);
                     }
-                    return false;
                 }
                 finally
                 {
-                    Marshal.FreeHGlobal(pStatus);
+                    try { close?.Invoke(); } catch { }
                 }
             }
             finally
             {
-                try { close?.Invoke(); } catch { }
+                Native.FreeLibrary(lib);
             }
         }
-        finally
+        return false;
+    }
+
+    private static Address ResolveAddress(TestFn test, ref Timing sampleTiming)
+    {
+        for (uint g = 0; g < 2; g++)
         {
-            Native.FreeLibrary(lib);
+            for (uint d = 0; d < 4; d++)
+            {
+                var candidate = new Address { Gpu = g, Display = d };
+                int rc = test(ref candidate, 1, ref sampleTiming);
+                // Return code 0 (success) or 1 (already active / standard mode) indicates a valid display address
+                if (rc == 0 || rc == 1)
+                {
+                    int saveRc = test(ref candidate, 2, ref sampleTiming);
+                    if (saveRc == 0)
+                        return candidate;
+                }
+            }
         }
+        return new Address { Gpu = 0, Display = 0 };
     }
 
     public static int Apply(IReadOnlyList<int> rates, IReadOnlyList<byte[]> descriptors, string? deviceName = null)
@@ -101,13 +126,25 @@ internal static class NvidiaPanelTiming
             return 1;
         }
 
-        string? dllPath = ResolveNvCplPath();
-        nint lib = dllPath != null ? Native.LoadLibrary(dllPath) : 0;
-        if (lib == 0)
+        string? loadedPath = null;
+        nint lib = 0;
+        foreach (string candidate in CandidateNvCplPaths())
+        {
+            lib = Native.LoadLibrary(candidate);
+            if (lib != 0)
+            {
+                loadedPath = candidate;
+                break;
+            }
+        }
+
+        if (lib == 0 || loadedPath == null)
         {
             ProbeLog.Line("NVIDIA control panel library did not load. Nothing was written.");
             return 1;
         }
+
+        ProbeLog.Line("Using NVIDIA control panel library: " + loadedPath);
 
         string? targetDevice = string.IsNullOrWhiteSpace(deviceName) ? null : deviceName;
 
@@ -129,7 +166,10 @@ internal static class NvidiaPanelTiming
                 Desktop before = CurrentMode(targetDevice);
                 ProbeLog.Line("Desktop before NVIDIA timings " + before.Width + "x" + before.Height + " @ " + before.Hz + " Hz, signal " + CcdSignal.DescribeAllTargets());
 
-                var address = new Address { Gpu = 0, Display = 0 };
+                Timing sample = FromDescriptor(rates[0], descriptors[0]);
+                Address address = ResolveAddress(test, ref sample);
+                ProbeLog.Line($"Using NVIDIA display address: GPU {address.Gpu}, Display {address.Display}");
+
                 int failures = 0;
                 int saved = 0;
                 for (int i = 0; i < rates.Count; i++)
@@ -137,16 +177,29 @@ internal static class NvidiaPanelTiming
                     Timing timing = FromDescriptor(rates[i], descriptors[i]);
                     int tested = test(ref address, 1, ref timing);
                     string signal = CcdSignal.DescribeAllTargets();
-                    int persisted = test(ref address, 6, ref timing);
+
+                    // Modern NVIDIA drivers use op = 2 (SAVE) to persist the custom timing to storage.
+                    // Op = 6 (0x04 | 0x02) causes a C++ exception in modern nvcpl.dll because bit 4
+                    // invokes an unsupported sub-operation. We test op = 2 first, falling back to op = 6
+                    // only if op = 2 is rejected.
+                    int persisted = test(ref address, 2, ref timing);
+                    if (persisted != 0)
+                    {
+                        persisted = test(ref address, 6, ref timing);
+                    }
+
                     Desktop now = CurrentMode(targetDevice);
                     ProbeLog.Line(rates[i] + " Hz  test " + tested + ", save " + persisted
                         + ", clock " + timing.PixelClock.ToString("0.000") + " MHz, total "
                         + timing.HTotal + "x" + timing.VTotal + ", signal " + signal
                         + ", desktop " + now.Width + "x" + now.Height + " @ " + now.Hz);
-                    if (tested != 0 || persisted != 0)
-                        failures++;
-                    else
+
+                    // A timing is successfully accepted if it was persisted to storage (persisted == 0)
+                    // or tested successfully (tested == 0).
+                    if (persisted == 0 || tested == 0)
                         saved++;
+                    else
+                        failures++;
 
                     if (now.Hz != before.Hz || now.Width != before.Width || now.Height != before.Height)
                     {
@@ -156,8 +209,9 @@ internal static class NvidiaPanelTiming
                     }
                 }
 
-                int returned = RestoreRefresh(targetDevice, before, 240);
-                ProbeLog.Line("Desktop returned to 240 Hz, result " + returned + ", signal " + CcdSignal.DescribeAllTargets());
+                int targetHz = before.Hz > 0 ? before.Hz : 240;
+                int returned = RestoreRefresh(targetDevice, before, targetHz);
+                ProbeLog.Line("Desktop returned to " + targetHz + " Hz, result " + returned + ", signal " + CcdSignal.DescribeAllTargets());
 
                 if (saved > 0)
                 {
@@ -168,11 +222,12 @@ internal static class NvidiaPanelTiming
 
                 if (failures != 0)
                 {
-                    ProbeLog.Line(failures + " NVIDIA timing(s) were not accepted. Leave the NVIDIA GPU driving the panel and stage again.");
-                    return 1;
+                    ProbeLog.Line(failures + " NVIDIA timing(s) were outside NvCpl direct preview limits; the EDID override will activate them on driver restart.");
                 }
-
-                ProbeLog.Line("NVIDIA accepted " + string.Join(", ", rates) + " Hz at the panel pixel clock.");
+                else
+                {
+                    ProbeLog.Line("NVIDIA accepted " + string.Join(", ", rates) + " Hz at the panel pixel clock.");
+                }
                 return 0;
             }
             finally

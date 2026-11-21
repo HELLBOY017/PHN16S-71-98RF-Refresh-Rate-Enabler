@@ -181,27 +181,25 @@ public static class Program
         }
 
         bool nvidia = IsNvidiaActive(monitor);
-        if (nvidia)
-        {
-            ProbeLog.Line("NVIDIA is driving the panel. Staging 60, 75, 100, 120, 144, and 165 Hz through the NVIDIA control panel API. The EDID stays original.");
-            int applied = NvidiaPanelTiming.Apply(rates, descriptors, monitor.DeviceName);
-            if (applied != 0)
-                return applied;
-            ProbeLog.Line("The 240 Hz timing is still the preferred mode.");
-            return 0;
-        }
+        string targetGpu = nvidia ? "NVIDIA" : "Intel";
+        ProbeLog.Line(targetGpu + " is driving the panel. Staging the EDID override after the original 240 Hz block.");
 
-        ProbeLog.Line("Intel is driving the panel. Staging the EDID override after the original 240 Hz block. NVIDIA is left unchanged.");
-        IReadOnlyList<string> paths = IntelPaths(monitor);
+        IReadOnlyList<string> paths = nvidia ? NvidiaPaths(monitor) : IntelPaths(monitor);
+        if (paths.Count == 0)
+            paths = PanelPaths(monitor);
+
         if (!force && paths.Any(OverrideExists))
         {
-            ProbeLog.Line("EDID_OVERRIDE already exists. Nothing was written. Re-run with --force to replace it, or remove it first.");
+            ProbeLog.Line("EDID_OVERRIDE already exists for " + targetGpu + ". Nothing was written. Re-run with --force to replace it, or remove it first.");
             return 1;
         }
 
-        EnableIntelDrr();
+        if (!nvidia)
+        {
+            EnableIntelDrr();
+        }
 
-        bool wroteIntel = false;
+        bool wroteOverride = false;
         foreach (string path in paths)
         {
             byte[] instanceEdid = ReadEdidAt(path);
@@ -213,9 +211,11 @@ public static class Program
 
             try
             {
-                PanelEdid.BuildOverride(instanceEdid, descriptors, out byte[] block0, out byte[] block1, out byte[][] extras);
+                byte[] block0, block1;
+                byte[][] extras;
+                PanelEdid.BuildOverride(instanceEdid, descriptors, out block0, out block1, out extras, patchProductCode: true);
                 WriteBlocks(path, block0, block1, extras);
-                wroteIntel = true;
+                wroteOverride = true;
                 ProbeLog.Line("Staged " + AdapterLabel(path) + " (" + path + ").");
             }
             catch (Exception ex)
@@ -226,13 +226,16 @@ public static class Program
             }
         }
 
-        if (!wroteIntel)
+        if (!wroteOverride)
         {
-            ProbeLog.Line("No Intel panel EDID was found, so no override was written.");
+            ProbeLog.Line("No " + targetGpu + " panel EDID was found, so no override was written.");
             return 1;
         }
 
-        ProbeLog.Line("Staged " + string.Join(", ", rates) + " Hz for Intel after the original 240 Hz block.");
+        // On NVIDIA, eDP panel timings are loaded purely via the 256-byte EDID override on driver reload.
+        // NvCplApiCTTest direct live-testing is skipped on laptop eDP panels to avoid tripping panel TCON protection.
+
+        ProbeLog.Line("Staged " + string.Join(", ", rates) + " Hz for " + targetGpu + " after the original 240 Hz block.");
         for (int i = 0; i < rates.Count; i++)
             ProbeLog.Line("  " + rates[i] + " Hz vertical total " + PanelEdid.ReadVerticalTotal(descriptors[i]));
         ProbeLog.Line("The 240 Hz timing is still the preferred mode. Restart the display driver to load these modes.");
@@ -248,27 +251,22 @@ public static class Program
             return 1;
         }
 
-        ProbeLog.Line("Remove override removes the Intel EDID override and restores driver DRR settings.");
+        ProbeLog.Line("Removing refresh rate overrides...");
         bool removed = false;
-        foreach (string path in IntelPaths(monitor))
+        var paths = PanelPaths(monitor);
+
+        foreach (string path in paths)
         {
             if (!OverrideExists(path))
                 continue;
             DeleteOverride(path);
             removed = true;
-            ProbeLog.Line("Removed the Intel override.");
+            ProbeLog.Line("Removed the " + AdapterLabel(path) + " override (" + path + ").");
         }
         if (!removed)
-            ProbeLog.Line("No Intel EDID_OVERRIDE key.");
+            ProbeLog.Line("No EDID_OVERRIDE key found.");
 
         RestoreIntelDrr();
-
-        if (IsNvidiaActive(monitor))
-        {
-            ProbeLog.Line("NVIDIA custom timings stay in the driver.");
-            ProbeLog.Line("Clean install the driver from the NVIDIA app to remove them.");
-            return 0;
-        }
 
         ProbeLog.Line("Restart the display driver to load the original 240 Hz panel timing.");
         return 0;
@@ -357,15 +355,24 @@ public static class Program
     }
 
     internal static bool OverrideExists(MonitorInfo monitor)
-        => IntelPaths(monitor).Any(OverrideExists);
+    {
+        bool nvidia = IsNvidiaActive(monitor);
+        var paths = nvidia ? NvidiaPaths(monitor) : IntelPaths(monitor);
+        if (paths.Count == 0)
+            paths = PanelPaths(monitor);
+        return paths.Any(OverrideExists);
+    }
 
     internal static bool IntelOverrideExists(MonitorInfo monitor)
         => IntelPaths(monitor).Any(OverrideExists);
 
+    internal static bool NvidiaOverrideExists(MonitorInfo monitor)
+        => NvidiaPaths(monitor).Any(OverrideExists);
+
     internal static Dictionary<string, Dictionary<string, byte[]>> ReadOverrides(MonitorInfo monitor)
     {
         var saved = new Dictionary<string, Dictionary<string, byte[]>>(StringComparer.OrdinalIgnoreCase);
-        foreach (string path in IntelPaths(monitor))
+        foreach (string path in PanelPaths(monitor))
         {
             Dictionary<string, byte[]>? values = ReadOverride(path);
             if (values != null)
@@ -378,14 +385,13 @@ public static class Program
     {
         foreach (var entry in saved)
         {
-            if (string.Equals(AdapterLabel(entry.Key), "Intel", StringComparison.Ordinal))
-                WriteOverride(entry.Key, entry.Value);
+            WriteOverride(entry.Key, entry.Value);
         }
     }
 
     internal static void DeleteOverrides(MonitorInfo monitor)
     {
-        foreach (string path in IntelPaths(monitor))
+        foreach (string path in PanelPaths(monitor))
             DeleteOverride(path);
     }
 
@@ -442,6 +448,9 @@ public static class Program
 
     private static IReadOnlyList<string> IntelPaths(MonitorInfo monitor)
         => PanelPaths(monitor).Where(path => string.Equals(AdapterLabel(path), "Intel", StringComparison.Ordinal)).ToList();
+
+    private static IReadOnlyList<string> NvidiaPaths(MonitorInfo monitor)
+        => PanelPaths(monitor).Where(path => string.Equals(AdapterLabel(path), "NVIDIA", StringComparison.Ordinal)).ToList();
 
     private const string DisplayClassGuid = @"{4d36e968-e325-11ce-bfc1-08002be10318}";
     private const string DisplayClassPath = @"SYSTEM\CurrentControlSet\Control\Class\" + DisplayClassGuid;
@@ -959,6 +968,36 @@ internal static class MonitorLocator
         }
 
         if (best == null)
+        {
+            device = new Native.DisplayDevice { cb = Marshal.SizeOf<Native.DisplayDevice>() };
+            for (uint index = 0; Native.EnumDisplayDevices(null, index, ref device, 0); index++)
+            {
+                for (uint monIndex = 0; ; monIndex++)
+                {
+                    var monitor = new Native.DisplayDevice { cb = Marshal.SizeOf<Native.DisplayDevice>() };
+                    if (!Native.EnumDisplayDevices(device.DeviceName, monIndex, ref monitor, 0))
+                        break;
+                    var monitorIface = new Native.DisplayDevice { cb = Marshal.SizeOf<Native.DisplayDevice>() };
+                    string ifaceId = Native.EnumDisplayDevices(device.DeviceName, monIndex, ref monitorIface, EddGetDeviceInterfaceName)
+                        ? monitorIface.DeviceID
+                        : "";
+                    string? activeInstance = ExtractInstanceFromInterfacePath(ifaceId) ?? ccdActiveInstance;
+                    List<string> registryPaths = FindEdidParameters(monitor.DeviceID, ifaceId, activeInstance);
+                    if (registryPaths.Count == 0)
+                        continue;
+                    if (monitor.DeviceID.Contains("SDC41AB", StringComparison.OrdinalIgnoreCase) ||
+                        monitor.DeviceID.Contains("SDC4179", StringComparison.OrdinalIgnoreCase))
+                    {
+                        best = new Candidate(device, monitor, ifaceId, registryPaths, 1);
+                        break;
+                    }
+                }
+                if (best != null) break;
+                device = new Native.DisplayDevice { cb = Marshal.SizeOf<Native.DisplayDevice>() };
+            }
+        }
+
+        if (best == null)
             return null;
 
         var mode = new Native.DevMode { dmSize = (short)Marshal.SizeOf<Native.DevMode>() };
@@ -1151,7 +1190,7 @@ internal sealed class CcdSignal
     }
 
     private static bool IsInternalTechnology(uint tech)
-        => tech is 0x80000000u or 10u or 6u;
+        => tech is 0x80000000u or 11u or 10u or 6u;
 
     internal static bool TryQueryActiveConfig(out Native.PathInfo[] paths, out Native.ModeInfo[] modes, out uint pathCount, out uint modeCount)
     {
@@ -1160,15 +1199,11 @@ internal sealed class CcdSignal
         pathCount = 0;
         modeCount = 0;
 
-        uint flags = Native.QdcOnlyActivePaths | Native.QdcVirtualRefreshRateAware;
+        uint flags = Native.QdcOnlyActivePaths;
         for (int attempt = 0; attempt < 3; attempt++)
         {
             if (Native.GetDisplayConfigBufferSizes(flags, out pathCount, out modeCount) != 0)
-            {
-                flags = Native.QdcOnlyActivePaths;
-                if (Native.GetDisplayConfigBufferSizes(flags, out pathCount, out modeCount) != 0)
-                    return false;
-            }
+                return false;
             paths = new Native.PathInfo[pathCount];
             modes = new Native.ModeInfo[modeCount];
             int rc = Native.QueryDisplayConfig(flags, ref pathCount, paths, ref modeCount, modes, IntPtr.Zero);
@@ -1188,18 +1223,35 @@ internal sealed class CcdSignal
                 return false;
 
             ref var p = ref paths[0];
-            if ((p.flags & Native.DisplayConfigPathBoostRefreshRate) != 0)
+            uint currentFlags = p.flags;
+            bool alreadyBoosted = (currentFlags & Native.DisplayConfigPathBoostRefreshRate) != 0;
+
+            // Calculate boost multiplier based on current refresh rate:
+            // For 240 Hz with 60 Hz base, multiplier is 4 (4 << 16 = 0x00040000).
+            // For 120 Hz with 60 Hz base, multiplier is 2 (2 << 16 = 0x00020000).
+            uint multiplier = 1;
+            if (p.Target.refreshRate.Denominator > 0)
             {
-                ProbeLog.Line("Dynamic Refresh Rate (DRR) is already active on the display path.");
+                double hz = (double)p.Target.refreshRate.Numerator / p.Target.refreshRate.Denominator;
+                if (Math.Abs(hz - 240.0) < 1.0)
+                    multiplier = 4;
+                else if (Math.Abs(hz - 120.0) < 1.0)
+                    multiplier = 2;
+            }
+
+            uint multiplierField = (multiplier & 0x3Fu) << 16;
+            if (alreadyBoosted && (currentFlags & 0x003F0000u) == multiplierField)
+            {
+                ProbeLog.Line($"Dynamic Refresh Rate (DRR) is already active ({multiplier}x boost) on the display path.");
                 return true;
             }
 
-            p.flags |= Native.DisplayConfigPathBoostRefreshRate;
-            uint setFlags = Native.SdcApply | Native.SdcUseSuppliedDisplayConfig | Native.SdcAllowChanges | Native.SdcVirtualRefreshRateAware;
+            p.flags = (currentFlags & ~0x003F0000u) | Native.DisplayConfigPathBoostRefreshRate | multiplierField;
+            uint setFlags = Native.SdcApply | Native.SdcUseSuppliedDisplayConfig | Native.SdcAllowChanges;
             int rc = Native.SetDisplayConfig(pathCount, paths, modeCount, modes, setFlags);
             if (rc == 0)
             {
-                ProbeLog.Line("Engaged Dynamic Refresh Rate (DRR) in Windows Display Manager via CCD.");
+                ProbeLog.Line($"Engaged Dynamic Refresh Rate (DRR) ({multiplier}x boost) in Windows Display Manager via CCD.");
                 return true;
             }
             else
@@ -1436,7 +1488,7 @@ internal sealed class PanelEdid
         {
             byte[][] chunk = descriptors.Skip(i).Take(5).ToArray();
             byte[] block = BuildExtension(chunk);
-            int checksumAt = block[2] + 5;
+            int checksumAt = block[2] == 121 ? 126 : block[2] + 5;
             int displayIdSum = 0;
             for (int n = 1; n <= checksumAt; n++)
                 displayIdSum += block[n];
@@ -1449,7 +1501,7 @@ internal sealed class PanelEdid
         return true;
     }
 
-    public static void BuildOverride(byte[] sourceEdid, IReadOnlyList<byte[]> added, out byte[] block0, out byte[] block1, out byte[][] extras)
+    public static void BuildOverride(byte[] sourceEdid, IReadOnlyList<byte[]> added, out byte[] block0, out byte[] block1, out byte[][] extras, bool patchProductCode = true)
     {
         if (sourceEdid.Length < 256)
             throw new InvalidOperationException("EDID is shorter than 256 bytes.");
@@ -1475,13 +1527,13 @@ internal sealed class PanelEdid
         // NVIDIA's GPU-only switch asks the dGPU for a mode list before the panel is moved.
         // Replacing the first DisplayID block makes that list empty, SetDisplayConfig returns
         // ERROR_BAD_CONFIGURATION, and the NVIDIA app snaps back to Auto. Keep the original
-        // 240 Hz block first. The extra rates stay in the second block for the Intel driver.
+        // 240 Hz block first. The extra rates stay in the following extension blocks.
         var primary = new List<byte[]>();
         void Take(byte tag)
         {
             byte[]? block = others.FirstOrDefault(item => item[0] == tag);
             if (block != null)
-                primary.Add(PatchDisplayIdBlock(block, preferred));
+                primary.Add(PatchDisplayIdBlock(block, preferred, patchProductCode));
         }
         Take(0x20);
         Take(0x21);
@@ -1492,7 +1544,7 @@ internal sealed class PanelEdid
         foreach (byte[] block in others)
         {
             if (block[0] is not (0x20 or 0x21 or 0x26 or 0x81 or 0x2B))
-                primary.Add(PatchDisplayIdBlock(block, preferred));
+                primary.Add(PatchDisplayIdBlock(block, preferred, patchProductCode));
         }
 
         var chunks = new List<byte[][]>();
@@ -1516,7 +1568,7 @@ internal sealed class PanelEdid
         // Spoofing Manufacturer SAM (0x4C, 0x2D) and Product Code 0x100A (0x0A, 0x10) allows the
         // driver to match entry 94 and enables full 48 Hz - 240 Hz Dynamic Refresh Rate (DRR).
         // Descriptors 0 and 2 remain clean (zeros) as in stock EDID to avoid invalid scaled-clock modes.
-        if (sourceEdid.Length >= 12 && sourceEdid[8] == 0x4C && (sourceEdid[9] == 0x83 || sourceEdid[9] == 0x2D))
+        if (patchProductCode && sourceEdid.Length >= 12 && sourceEdid[8] == 0x4C && (sourceEdid[9] == 0x83 || sourceEdid[9] == 0x2D))
         {
             block0[8] = 0x4C;
             block0[9] = 0x2D; // SAM (Samsung)
@@ -1534,14 +1586,70 @@ internal sealed class PanelEdid
         }
     }
 
-    private static byte[] PatchDisplayIdBlock(byte[] block, IReadOnlyList<byte[]> preferred)
+    public static byte[] EncodeDtd(int width, int height, int pclkKhz, int hfp, int hsw, int hbp, int vfp, int vsw, int vbp, bool hpos = false, bool vpos = false)
+    {
+        var dtd = new byte[18];
+        int pclk10k = (int)Math.Round(pclkKhz / 10.0);
+        dtd[0] = (byte)(pclk10k & 0xFF);
+        dtd[1] = (byte)((pclk10k >> 8) & 0xFF);
+
+        int hBlank = hfp + hsw + hbp;
+        dtd[2] = (byte)(width & 0xFF);
+        dtd[3] = (byte)(hBlank & 0xFF);
+        dtd[4] = (byte)(((width >> 8) & 0x0F) << 4 | ((hBlank >> 8) & 0x0F));
+
+        int vBlank = vfp + vsw + vbp;
+        dtd[5] = (byte)(height & 0xFF);
+        dtd[6] = (byte)(vBlank & 0xFF);
+        dtd[7] = (byte)(((height >> 8) & 0x0F) << 4 | ((vBlank >> 8) & 0x0F));
+
+        dtd[8] = (byte)(hfp & 0xFF);
+        dtd[9] = (byte)(hsw & 0xFF);
+        dtd[10] = (byte)(((vfp & 0x0F) << 4) | (vsw & 0x0F));
+        dtd[11] = (byte)((((hfp >> 8) & 0x03) << 6) | (((hsw >> 8) & 0x03) << 4) | (((vfp >> 4) & 0x03) << 2) | ((vsw >> 4) & 0x03));
+
+        int hSizeMm = 344;
+        int vSizeMm = 215;
+        dtd[12] = (byte)(hSizeMm & 0xFF);
+        dtd[13] = (byte)(vSizeMm & 0xFF);
+        dtd[14] = (byte)(((hSizeMm >> 8) & 0x0F) << 4 | ((vSizeMm >> 8) & 0x0F));
+
+        dtd[15] = 0;
+        dtd[16] = 0;
+        byte flags = 0x18;
+        if (vpos) flags |= 0x04;
+        if (hpos) flags |= 0x02;
+        dtd[17] = flags;
+        return dtd;
+    }
+
+    public static byte[] BuildCta861Block(IReadOnlyList<byte[]> dtds)
+    {
+        var block = new byte[128];
+        block[0] = 0x02; // Tag: CTA-861
+        block[1] = 0x03; // Revision 3
+        block[2] = 0x04; // DTD offset
+        block[3] = 0x00; // Flags
+        int offset = 4;
+        foreach (byte[] dtd in dtds)
+        {
+            if (offset + 18 > 127)
+                break;
+            Buffer.BlockCopy(dtd, 0, block, offset, 18);
+            offset += 18;
+        }
+        block[127] = BlockChecksum(block, 0);
+        return block;
+    }
+
+    private static byte[] PatchDisplayIdBlock(byte[] block, IReadOnlyList<byte[]> preferred, bool patchProductCode = true)
     {
         if (block.Length < 3)
             return block;
 
         // Tag 0x20 is DisplayID Product Identification Data Block
         // Patch Product Code to 0x0A, 0x10 (SAM 0x100A) if vendor is Samsung SDC ("\xBA\x41\x59")
-        if (block[0] == 0x20 && block.Length >= 8)
+        if (patchProductCode && block[0] == 0x20 && block.Length >= 8)
         {
             if (block[3] == 0xBA && block[4] == 0x41 && block[5] == 0x59)
             {
@@ -1658,7 +1766,7 @@ internal sealed class PanelEdid
         var section = new byte[128];
         section[0] = 0x70;
         section[1] = 0x20;
-        section[2] = (byte)length;
+        section[2] = 121; // VESA DisplayID v2.0 in EDID extension block must have section length 121 (0x79)
         section[3] = productType;
         section[4] = (byte)extensionCount;
         int offset = 5;
@@ -1668,11 +1776,12 @@ internal sealed class PanelEdid
             offset += block.Length;
         }
 
-        int checksumAt = length + 5;
+        // Remaining bytes from offset to 125 are 0x00 padding (default in new byte[128])
+        // DisplayID checksum is at byte 126 (sum of bytes 1..126 must be 0 mod 256)
         int sum = 0;
-        for (int i = 1; i < checksumAt; i++)
+        for (int i = 1; i < 126; i++)
             sum += section[i];
-        section[checksumAt] = (byte)((256 - (sum & 0xFF)) & 0xFF);
+        section[126] = (byte)((256 - (sum & 0xFF)) & 0xFF);
         section[127] = BlockChecksum(section, 0);
         return section;
     }
@@ -1689,7 +1798,7 @@ internal sealed class PanelEdid
     {
         if (block.Length < 128 || block[0] != 0x70)
             return false;
-        int checksumAt = block[2] + 5;
+        int checksumAt = block[2] == 121 ? 126 : block[2] + 5;
         if (checksumAt > 126)
             return false;
         int sum = 0;
@@ -1703,11 +1812,10 @@ internal sealed class PanelEdid
         if (descriptors.Count < 1 || descriptors.Count > 5)
             throw new ArgumentException("A DisplayID extension can hold 1 to 5 Type VII timings.");
 
-        int payload = 3 + 20 * descriptors.Count;
         var block = new byte[128];
         block[0] = 0x70;
         block[1] = 0x20;
-        block[2] = (byte)payload;
+        block[2] = 121; // VESA DisplayID v2.0 in EDID extension block must have section length 121 (0x79)
         block[3] = 0x00;
         block[4] = (byte)followingSections;
         block[5] = 0x22;
@@ -1722,11 +1830,10 @@ internal sealed class PanelEdid
             offset += 20;
         }
 
-        int checksumAt = payload + 5;
         int sum = 0;
-        for (int i = 1; i < checksumAt; i++)
+        for (int i = 1; i < 126; i++)
             sum += block[i];
-        block[checksumAt] = (byte)((256 - (sum & 0xFF)) & 0xFF);
+        block[126] = (byte)((256 - (sum & 0xFF)) & 0xFF);
         block[127] = BlockChecksum(block, 0);
         return block;
     }
