@@ -27,6 +27,7 @@ public static class Program
         bool force = Has(args, "--force");
         bool stage = Has(args, "--stage");
         bool restart = Has(args, "--restart");
+        bool restoreHdr = Has(args, "--restore-hdr") || Has(args, "--hdr");
 
         if (Has(args, "--help") || Has(args, "-h"))
         {
@@ -45,7 +46,7 @@ public static class Program
         }
 
         EnsureConsole();
-        if ((stage || revert || restart) && !IsAdmin())
+        if ((stage || revert || restart || restoreHdr) && !IsAdmin())
         {
             ProbeLog.Line("Administrator approval is required.");
             int? elevated = RelaunchElevated(args, wait: true);
@@ -128,6 +129,15 @@ public static class Program
             + monitor.CurrentHz + " Hz.");
         ProbeLog.Line("60, 75, 100, 120, 144, and 165 Hz keep this pixel clock and lengthen the frame with vertical blanking.");
         ProbeLog.Line("The GPU driving the panel is " + ActiveGpu(monitor) + ". Only that GPU is changed.");
+
+        if (restoreHdr)
+        {
+            int hdrResult = RestoreHdrCertification(monitor);
+            if (hdrResult != 0)
+                return hdrResult;
+            if (!stage && !revert && !restart)
+                return 0;
+        }
 
         if (revert)
         {
@@ -230,6 +240,9 @@ public static class Program
         // On NVIDIA, eDP panel timings are loaded purely via the 256-byte EDID override on driver reload.
         // NvCplApiCTTest direct live-testing is skipped on laptop eDP panels to avoid tripping panel TCON protection.
 
+        // Restore/ensure VESA True Black 500 HDR certification
+        RestoreHdrCertification(monitor);
+
         ProbeLog.Line("Staged " + string.Join(", ", rates) + " Hz for " + targetGpu + " after the original 240 Hz block.");
         for (int i = 0; i < rates.Count; i++)
             ProbeLog.Line("  " + rates[i] + " Hz vertical total " + PanelEdid.ReadVerticalTotal(descriptors[i]));
@@ -263,6 +276,245 @@ public static class Program
 
         ProbeLog.Line("Restart the display driver to load the original 240 Hz panel timing.");
         return 0;
+    }
+
+    private static readonly string[] TrueBlack500Guids = new string[]
+    {
+        "3B6DAA9E-3794-4D85-897E-93AE990D275D", // VESA DisplayHDR True Black 500 (CTS 1.2 Table 1)
+        "86413F8C-0CDB-4D49-81F7-06BB64A8FED1", // VESA DisplayHDR True Black 500 (CTS 1.1 Table 1)
+        "E7E7349F-EF0A-4EF7-A561-C8F633F27463"  // VESA DisplayHDR True Black 500 (CTS 1.2 Table 2)
+    };
+
+    internal static int RestoreHdrCertification(MonitorInfo? monitor)
+    {
+        ProbeLog.Line("");
+        if (!IsAdmin())
+        {
+            ProbeLog.Line("Restoring HDR certification needs an elevated process. Nothing was written.");
+            return 1;
+        }
+
+        ProbeLog.Line("Restoring VESA DisplayHDR True Black 500 certification...");
+
+        int written = 0;
+
+        // 1. Enable DisplayHDR feature set in GraphicsDrivers
+        try
+        {
+            using var featureKey = Registry.LocalMachine.CreateSubKey(@"SYSTEM\CurrentControlSet\Control\GraphicsDrivers\FeatureSetUsage");
+            if (featureKey != null)
+            {
+                featureKey.SetValue("DisplayHDR", 1, RegistryValueKind.DWord);
+            }
+        }
+        catch (Exception ex)
+        {
+            ProbeLog.Line("Warning: Could not set FeatureSetUsage\\DisplayHDR: " + ex.Message);
+        }
+
+        // 2. Write DisplayHdrLevel to Monitor Driver keys (Control\Class\{4d36e96e-e325-11ce-bfc1-08002be10318})
+        // This is the EXACT location queried by dxgkrnl.sys (DxgMonitor::MonitorColorState::_ReadDisplayHdrSupportFromPnpRegistry)
+        const string monitorClassPath = @"SYSTEM\CurrentControlSet\Control\Class\{4d36e96e-e325-11ce-bfc1-08002be10318}";
+        try
+        {
+            using var classKey = Registry.LocalMachine.OpenSubKey(monitorClassPath);
+            if (classKey != null)
+            {
+                foreach (string subName in classKey.GetSubKeyNames())
+                {
+                    if (string.Equals(subName, "Properties", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(subName, "Configuration", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    try
+                    {
+                        using var subKey = Registry.LocalMachine.CreateSubKey(monitorClassPath + @"\" + subName);
+                        if (subKey != null)
+                        {
+                            subKey.SetValue("DisplayHdrLevel", TrueBlack500Guids, RegistryValueKind.MultiString);
+                            subKey.SetValue("DisplayHdrLevelNotified", 1, RegistryValueKind.DWord);
+                            written++;
+                            ProbeLog.Line("  Updated driver certification in Class\\...\\" + subName);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        ProbeLog.Line("  Warning: Could not update Class\\...\\" + subName + ": " + ex.Message);
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            ProbeLog.Line("Warning: Could not enumerate Monitor Class keys: " + ex.Message);
+        }
+
+        // 3. Write DisplayHdrLevel to Monitor Device Parameters (Enum\DISPLAY\...\Device Parameters)
+        try
+        {
+            using var enumDisplayKey = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Enum\DISPLAY");
+            if (enumDisplayKey != null)
+            {
+                foreach (string monId in enumDisplayKey.GetSubKeyNames())
+                {
+                    if (!monId.StartsWith("SDC", StringComparison.OrdinalIgnoreCase) &&
+                        !monId.StartsWith("SAM", StringComparison.OrdinalIgnoreCase) &&
+                        !monId.Contains("41AB", StringComparison.OrdinalIgnoreCase) &&
+                        !monId.Contains("4179", StringComparison.OrdinalIgnoreCase) &&
+                        !monId.Contains("100A", StringComparison.OrdinalIgnoreCase) &&
+                        !monId.Equals("Default_Monitor", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    using var monKey = enumDisplayKey.OpenSubKey(monId);
+                    if (monKey == null) continue;
+
+                    foreach (string inst in monKey.GetSubKeyNames())
+                    {
+                        try
+                        {
+                            using var paramKey = Registry.LocalMachine.CreateSubKey(@"SYSTEM\CurrentControlSet\Enum\DISPLAY\" + monId + @"\" + inst + @"\Device Parameters");
+                            if (paramKey != null)
+                            {
+                                paramKey.SetValue("DisplayHdrLevel", TrueBlack500Guids, RegistryValueKind.MultiString);
+                                paramKey.SetValue("DisplayHdrLevelNotified", 1, RegistryValueKind.DWord);
+                                written++;
+                                ProbeLog.Line("  Updated device certification in Enum\\DISPLAY\\" + monId + "\\" + inst + "\\Device Parameters");
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            ProbeLog.Line("  Warning: Could not update Enum\\DISPLAY\\" + monId + "\\" + inst + ": " + ex.Message);
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            ProbeLog.Line("Warning: Could not enumerate Enum\\DISPLAY: " + ex.Message);
+        }
+
+        // 4. Identify all relevant MonitorDataStore subkeys
+        var targetSubkeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "SDC41AB0_00_07E7_FE",
+            "SDC41AB0_00_07E7_FC",
+            "SDC41790_00_07E7_FE",
+            "SDC41790_00_07E7_FC",
+            "SAM100A0_00_07E7_FE",
+            "SAM100A0_00_07E7_FC"
+        };
+
+        // Query active monitor ID from CCD if available
+        string? activeMdsId = QueryActiveMonitorDataStoreId();
+        if (!string.IsNullOrEmpty(activeMdsId))
+        {
+            targetSubkeys.Add(activeMdsId);
+        }
+
+        // Add any existing subkeys under MonitorDataStore matching SDC, 41AB, or 4179
+        const string mdsPath = @"SYSTEM\CurrentControlSet\Control\GraphicsDrivers\MonitorDataStore";
+        try
+        {
+            using var mdsKey = Registry.LocalMachine.OpenSubKey(mdsPath);
+            if (mdsKey != null)
+            {
+                foreach (string subName in mdsKey.GetSubKeyNames())
+                {
+                    if (subName.StartsWith("SDC", StringComparison.OrdinalIgnoreCase) ||
+                        subName.StartsWith("SAM", StringComparison.OrdinalIgnoreCase) ||
+                        subName.Contains("41AB", StringComparison.OrdinalIgnoreCase) ||
+                        subName.Contains("4179", StringComparison.OrdinalIgnoreCase) ||
+                        subName.Contains("100A", StringComparison.OrdinalIgnoreCase))
+                    {
+                        targetSubkeys.Add(subName);
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            ProbeLog.Line("Warning: Could not enumerate MonitorDataStore: " + ex.Message);
+        }
+
+        foreach (string subName in targetSubkeys)
+        {
+            try
+            {
+                using var key = Registry.LocalMachine.CreateSubKey(mdsPath + @"\" + subName);
+                if (key != null)
+                {
+                    key.SetValue("DisplayHdrLevel", TrueBlack500Guids, RegistryValueKind.MultiString);
+                    key.SetValue("AutoColorManagementSupported", 1, RegistryValueKind.DWord);
+                    key.SetValue("HDREnabled", 1, RegistryValueKind.DWord);
+                    key.SetValue("DisplayHdrLevelNotified", 1, RegistryValueKind.DWord);
+                    written++;
+                    ProbeLog.Line("  Updated certification in MonitorDataStore\\" + subName);
+                }
+            }
+            catch (Exception ex)
+            {
+                ProbeLog.Line("  Failed to update MonitorDataStore\\" + subName + ": " + ex.Message);
+            }
+        }
+
+        // 5. Trigger monitor PnP refresh so dxgkrnl re-evaluates certification immediately
+        try
+        {
+            string refreshMsg = DriverRestart.RestartMonitors();
+            ProbeLog.Line("PnP status: " + refreshMsg);
+        }
+        catch (Exception ex)
+        {
+            ProbeLog.Line("Warning: Could not refresh monitor devices: " + ex.Message);
+        }
+
+        if (written > 0)
+        {
+            ProbeLog.Line("Restored VESA DisplayHDR True Black 500 certification across " + written + " registry location(s).");
+            ProbeLog.Line("Restart the display driver or reopen Windows Display Settings to view the certification badge.");
+            return 0;
+        }
+
+        ProbeLog.Line("Failed to write HDR certification.");
+        return 1;
+    }
+
+    private static string? QueryActiveMonitorDataStoreId()
+    {
+        try
+        {
+            if (Native.GetDisplayConfigBufferSizes(2, out uint numPath, out uint numMode) != 0 || numPath == 0)
+                return null;
+
+            var paths = new Native.PathInfo[numPath];
+            var modes = new Native.ModeInfo[numMode];
+            if (Native.QueryDisplayConfig(2, ref numPath, paths, ref numMode, modes, IntPtr.Zero) != 0)
+                return null;
+
+            for (int i = 0; i < numPath; i++)
+            {
+                var packet = new Native.MonitorDataStoreDeviceInfo
+                {
+                    header = new Native.DeviceInfoHeader
+                    {
+                        type = unchecked((int)0xfffffff9),
+                        size = Marshal.SizeOf<Native.MonitorDataStoreDeviceInfo>(),
+                        adapterId = paths[i].Target.adapterId,
+                        id = paths[i].Target.id
+                    }
+                };
+                if (Native.DisplayConfigGetDeviceInfo(ref packet) == 0 && !string.IsNullOrWhiteSpace(packet.monitorId))
+                {
+                    return packet.monitorId.Trim();
+                }
+            }
+        }
+        catch
+        {
+            // Fallback to static list and registry enumeration
+        }
+        return null;
     }
 
     internal static string ActiveGpu(MonitorInfo monitor)
@@ -559,12 +811,13 @@ public static class Program
     private static void WriteHelp()
     {
         ProbeLog.Line("PHN16S-71-98RF Refresh Rate Enabler");
-        ProbeLog.Line("  (no args)     open the window");
-        ProbeLog.Line("  --stage       write 60, 75, 100, 120, 144, and 165 Hz");
-        ProbeLog.Line("  --force       replace an existing override");
-        ProbeLog.Line("  --revert      remove the Intel EDID override");
+        ProbeLog.Line("  (no args)       open the window");
+        ProbeLog.Line("  --stage         write 60, 75, 100, 120, 144, and 165 Hz");
+        ProbeLog.Line("  --restore-hdr   restore VESA DisplayHDR True Black 500 certification");
+        ProbeLog.Line("  --force         replace an existing override");
+        ProbeLog.Line("  --revert        remove the Intel EDID override");
         ProbeLog.Line("NVIDIA timings are removed by a clean install from the NVIDIA app.");
-        ProbeLog.Line("  --restart     restart the display driver");
+        ProbeLog.Line("  --restart       restart the display driver");
         ProbeLog.Line("Press F8 within 15 seconds of a restart if the panel stays black.");
     }
 
@@ -744,7 +997,8 @@ internal static class MonitorLocator
                     if (registryPaths.Count == 0)
                         continue;
                     if (monitor.DeviceID.Contains("SDC41AB", StringComparison.OrdinalIgnoreCase) ||
-                        monitor.DeviceID.Contains("SDC4179", StringComparison.OrdinalIgnoreCase))
+                        monitor.DeviceID.Contains("SDC4179", StringComparison.OrdinalIgnoreCase) ||
+                        monitor.DeviceID.Contains("SAM100A", StringComparison.OrdinalIgnoreCase))
                     {
                         best = new Candidate(device, monitor, ifaceId, registryPaths, 1);
                         break;
@@ -1794,4 +2048,16 @@ internal static class Native
 
     [DllImport("user32.dll")]
     public static extern int DisplayConfigGetDeviceInfo(ref TargetDeviceName requestPacket);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct MonitorDataStoreDeviceInfo
+    {
+        public DeviceInfoHeader header;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 458)]
+        public string monitorId;
+        public ulong certificationFlags;
+    }
+
+    [DllImport("user32.dll")]
+    public static extern int DisplayConfigGetDeviceInfo(ref MonitorDataStoreDeviceInfo requestPacket);
 }

@@ -243,6 +243,58 @@ internal static class DriverRestart
         return "Restarted " + string.Join(", ", restarted) + ".";
     }
 
+    internal static string RestartMonitors()
+    {
+        Guid monitorClass = new("4d36e96e-e325-11ce-bfc1-08002be10318");
+        IntPtr set = SetupDiGetClassDevs(ref monitorClass, null, IntPtr.Zero, DigcfPresent);
+        if (set == IntPtr.Zero || set == new IntPtr(-1))
+            return "Could not list monitors.";
+
+        var restarted = new List<string>();
+        try
+        {
+            var info = new SpDevInfoData { cbSize = Marshal.SizeOf<SpDevInfoData>() };
+            for (uint index = 0; SetupDiEnumDeviceInfo(set, index, ref info); index++)
+            {
+                string name = ReadDescription(set, ref info);
+                var change = new SpPropChangeParams
+                {
+                    ClassInstallHeader = new SpClassInstallHeader
+                    {
+                        cbSize = Marshal.SizeOf<SpClassInstallHeader>(),
+                        InstallFunction = DifPropertyChange
+                    },
+                    StateChange = DicsPropChange,
+                    Scope = DicsFlagConfigSpecific,
+                    HwProfile = 0
+                };
+
+                bool queued = SetupDiSetClassInstallParams(set, ref info, ref change, Marshal.SizeOf<SpPropChangeParams>());
+                bool called = queued && SetupDiCallClassInstaller(DifPropertyChange, set, ref info);
+
+                if (CM_Get_DevNode_Status(out uint status, out uint problem, info.DevInst, 0) == 0 && problem != 0)
+                {
+                    change.StateChange = DicsEnable;
+                    SetupDiSetClassInstallParams(set, ref info, ref change, Marshal.SizeOf<SpPropChangeParams>());
+                    SetupDiCallClassInstaller(DifPropertyChange, set, ref info);
+                    Thread.Sleep(500);
+                    CM_Get_DevNode_Status(out status, out problem, info.DevInst, 0);
+                }
+
+                if (called && problem == 0)
+                    restarted.Add(name);
+
+                info = new SpDevInfoData { cbSize = Marshal.SizeOf<SpDevInfoData>() };
+            }
+        }
+        finally
+        {
+            SetupDiDestroyDeviceInfoList(set);
+        }
+
+        return restarted.Count > 0 ? "Refreshed " + string.Join(", ", restarted) : "No monitors refreshed.";
+    }
+
     private static bool ShouldSkip(string name)
     {
         string[] blocked = { "Remote", "Indirect", "Virtual", "Parsec", "Sunshine", "Miracast" };
