@@ -239,6 +239,8 @@ public static class Program
 
         // On NVIDIA, eDP panel timings are loaded purely via the 256-byte EDID override on driver reload.
         // NvCplApiCTTest direct live-testing is skipped on laptop eDP panels to avoid tripping panel TCON protection.
+        if (nvidia)
+            EnableNvidia240HzVrrFloor();
 
         // Restore/ensure VESA True Black 500 HDR certification
         RestoreHdrCertification(monitor);
@@ -273,6 +275,8 @@ public static class Program
         }
         if (!removed)
             ProbeLog.Line("No EDID_OVERRIDE key found.");
+
+        RestoreNvidiaVrrFloor();
 
         ProbeLog.Line("Restart the display driver to load the original 240 Hz panel timing.");
         return 0;
@@ -691,6 +695,113 @@ public static class Program
 
     private static IReadOnlyList<string> NvidiaPaths(MonitorInfo monitor)
         => PanelPaths(monitor).Where(path => string.Equals(AdapterLabel(path), "NVIDIA", StringComparison.Ordinal)).ToList();
+
+    private const string DisplayClassGuid = @"{4d36e968-e325-11ce-bfc1-08002be10318}";
+    private const string DisplayClassPath = @"SYSTEM\CurrentControlSet\Control\Class\" + DisplayClassGuid;
+    // NVIDIA's notebook VRR floor override is a REG_SZ list of "refreshHz*framePeriodUs" pairs.
+    // 1,000,000 / 48 Hz = 20,833.33 us. The driver accepts whole microseconds.
+    private const string NvidiaVrrFloorValueName = "VrrNBFMinOverride";
+    private const string NvidiaVrrFloorBackupValueName = "VrrNBFMinOverride_PreDRR";
+    private const string NvidiaVrrFloorBackupExistsValueName = "VrrNBFMinOverride_PreDRR_Exists";
+    private const string Nvidia240HzVrrFloor = "240*20833";
+
+    internal static List<string> FindNvidiaDriverClassKeys()
+    {
+        var list = new List<string>();
+        using RegistryKey? classKey = Registry.LocalMachine.OpenSubKey(DisplayClassPath, writable: false);
+        if (classKey == null)
+            return list;
+
+        foreach (string subName in classKey.GetSubKeyNames())
+        {
+            if (!int.TryParse(subName, out _))
+                continue;
+
+            using RegistryKey? subKey = classKey.OpenSubKey(subName, writable: false);
+            if (subKey == null)
+                continue;
+
+            string desc = subKey.GetValue("DriverDesc") as string ?? "";
+            string provider = subKey.GetValue("ProviderName") as string ?? "";
+            string matchId = subKey.GetValue("MatchingDeviceId") as string ?? "";
+            bool isNvidia = matchId.Contains("VEN_10DE", StringComparison.OrdinalIgnoreCase)
+                         || provider.Contains("NVIDIA", StringComparison.OrdinalIgnoreCase)
+                         || desc.Contains("NVIDIA", StringComparison.OrdinalIgnoreCase);
+            if (isNvidia)
+                list.Add(DisplayClassPath + @"\" + subName);
+        }
+        return list;
+    }
+
+    private static void EnableNvidia240HzVrrFloor()
+    {
+        foreach (string keyPath in FindNvidiaDriverClassKeys())
+        {
+            try
+            {
+                using RegistryKey? key = Registry.LocalMachine.OpenSubKey(keyPath, writable: true);
+                if (key == null)
+                    continue;
+
+                object? current = key.GetValue(NvidiaVrrFloorValueName);
+                if (key.GetValue(NvidiaVrrFloorBackupExistsValueName) == null)
+                {
+                    key.SetValue(NvidiaVrrFloorBackupExistsValueName, current == null ? 0 : 1, RegistryValueKind.DWord);
+                    if (current is string currentValue)
+                        key.SetValue(NvidiaVrrFloorBackupValueName, currentValue, RegistryValueKind.String);
+                }
+
+                string[] entries = (current as string ?? "")
+                    .Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                    .Where(entry => !entry.StartsWith("240*", StringComparison.OrdinalIgnoreCase))
+                    .Append(Nvidia240HzVrrFloor)
+                    .ToArray();
+
+                if (entries.Length > 4)
+                {
+                    ProbeLog.Line("NVIDIA " + NvidiaVrrFloorValueName + " already has four refresh entries; left it unchanged.");
+                    continue;
+                }
+
+                string configured = string.Join(';', entries);
+                key.SetValue(NvidiaVrrFloorValueName, configured, RegistryValueKind.String);
+                ProbeLog.Line("Set NVIDIA 240 Hz VRR floor override to 48 Hz (" + NvidiaVrrFloorValueName + " = " + configured + ").");
+            }
+            catch (Exception ex)
+            {
+                ProbeLog.Line("Failed to configure NVIDIA 240 Hz VRR floor at " + keyPath + ": " + ex.Message);
+            }
+        }
+    }
+
+    private static void RestoreNvidiaVrrFloor()
+    {
+        foreach (string keyPath in FindNvidiaDriverClassKeys())
+        {
+            try
+            {
+                using RegistryKey? key = Registry.LocalMachine.OpenSubKey(keyPath, writable: true);
+                if (key == null)
+                    continue;
+
+                if (key.GetValue(NvidiaVrrFloorBackupExistsValueName) is not int existed)
+                    continue;
+
+                if (existed == 0)
+                    key.DeleteValue(NvidiaVrrFloorValueName, throwOnMissingValue: false);
+                else if (key.GetValue(NvidiaVrrFloorBackupValueName) is string original)
+                    key.SetValue(NvidiaVrrFloorValueName, original, RegistryValueKind.String);
+
+                key.DeleteValue(NvidiaVrrFloorBackupValueName, throwOnMissingValue: false);
+                key.DeleteValue(NvidiaVrrFloorBackupExistsValueName, throwOnMissingValue: false);
+                ProbeLog.Line("Restored NVIDIA " + NvidiaVrrFloorValueName + ".");
+            }
+            catch (Exception ex)
+            {
+                ProbeLog.Line("Failed to restore NVIDIA VRR floor at " + keyPath + ": " + ex.Message);
+            }
+        }
+    }
 
     private static byte[] ReadEdidAt(string path)
     {
