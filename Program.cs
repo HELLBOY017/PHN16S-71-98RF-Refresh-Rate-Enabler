@@ -85,6 +85,7 @@ public static class Program
             ProbeLog.Line("  output    " + signal.Output);
         }
 
+
         byte[] edid = monitor.ReadEdid();
         var parsed = PanelEdid.Parse(edid);
         if (parsed.Error != null)
@@ -218,7 +219,8 @@ public static class Program
             {
                 byte[] block0, block1;
                 byte[][] extras;
-                PanelEdid.BuildOverride(instanceEdid, descriptors, out block0, out block1, out extras);
+                bool isNvidiaPath = string.Equals(AdapterLabel(path), "NVIDIA", StringComparison.Ordinal);
+                PanelEdid.BuildOverride(instanceEdid, descriptors, out block0, out block1, out extras, patchNvidiaAdaptiveSync: isNvidiaPath);
                 WriteBlocks(path, block0, block1, extras);
                 wroteOverride = true;
                 ProbeLog.Line("Staged " + AdapterLabel(path) + " (" + path + ").");
@@ -591,10 +593,19 @@ public static class Program
             return 1;
         }
 
+        bool nvidia = IsNvidiaActive(monitor);
+        if (nvidia)
+            EnableNvidia240HzVrrFloor();
+
         ProbeLog.Line("Restarting the display driver. The screen will go black for a few seconds.");
         ProbeLog.Line("Press F8 within 15 seconds if the panel stays black.");
         string outcome = DriverRestart.Restart(monitor);
         ProbeLog.Line(outcome);
+        if (nvidia && outcome.StartsWith("Restarted", StringComparison.Ordinal))
+        {
+            Thread.Sleep(2000);
+            CcdSignal.TryNormalizeStaticRefreshRate(maxAttempts: 10, delayMs: 500);
+        }
         return outcome.StartsWith("Restarted", StringComparison.Ordinal) ? 0 : 1;
     }
 
@@ -919,6 +930,8 @@ public static class Program
     private static bool Has(string[] args, string flag)
         => args.Any(a => string.Equals(a, flag, StringComparison.OrdinalIgnoreCase));
 
+
+
     private static void WriteHelp()
     {
         ProbeLog.Line("PHN16S-71-98RF Refresh Rate Enabler");
@@ -1150,6 +1163,39 @@ internal static class MonitorLocator
         };
     }
 
+    public static bool SwitchRefreshRate(string deviceName, int targetHz)
+    {
+        try
+        {
+            var current = new Native.DevMode { dmSize = (short)Marshal.SizeOf<Native.DevMode>() };
+            if (!Native.EnumDisplaySettings(deviceName, Native.EnumCurrentSettings, ref current))
+                return false;
+
+            if (current.dmDisplayFrequency == targetHz)
+                return true;
+
+            var listed = new Native.DevMode { dmSize = (short)Marshal.SizeOf<Native.DevMode>() };
+            for (int i = 0; Native.EnumDisplaySettings(deviceName, i, ref listed); i++)
+            {
+                if (listed.dmPelsWidth == current.dmPelsWidth &&
+                    listed.dmPelsHeight == current.dmPelsHeight &&
+                    listed.dmBitsPerPel == current.dmBitsPerPel &&
+                    listed.dmDisplayFrequency == targetHz)
+                {
+                    int rc = Native.ChangeDisplaySettingsEx(deviceName, ref listed, 0, 0x01 /* CDS_UPDATEREGISTRY */, 0);
+                    if (rc == 0)
+                        return true;
+                    rc = Native.ChangeDisplaySettingsEx(deviceName, ref listed, 0, 0, 0);
+                    return rc == 0;
+                }
+            }
+        }
+        catch
+        {
+        }
+        return false;
+    }
+
     private static string? ExtractInstanceFromInterfacePath(string? interfacePath)
     {
         if (string.IsNullOrWhiteSpace(interfacePath))
@@ -1322,10 +1368,9 @@ internal sealed class CcdSignal
         pathCount = 0;
         modeCount = 0;
 
-        uint flags = Native.QdcOnlyActivePaths;
         for (int attempt = 0; attempt < 3; attempt++)
         {
-            if (Native.GetDisplayConfigBufferSizes(flags, out pathCount, out modeCount) != 0)
+            if (Native.GetDisplayConfigBufferSizes(Native.QdcOnlyActivePaths, out pathCount, out modeCount) != 0)
                 return false;
             paths = new Native.PathInfo[pathCount];
             modes = new Native.ModeInfo[modeCount];
@@ -1334,6 +1379,90 @@ internal sealed class CcdSignal
                 return true;
             if (rc != 122) // ERROR_INSUFFICIENT_BUFFER
                 return false;
+        }
+        return false;
+    }
+
+    internal static bool TryNormalizeStaticRefreshRate(int maxAttempts = 1, int delayMs = 0)
+    {
+        int attempts = Math.Max(1, maxAttempts);
+        for (int attempt = 1; attempt <= attempts; attempt++)
+        {
+            try
+            {
+                if (!TryQueryActiveConfig(out var paths, out var modes, out uint pathCount, out uint modeCount) || pathCount == 0)
+                {
+                    if (attempt < attempts && delayMs > 0)
+                        Thread.Sleep(delayMs);
+                    continue;
+                }
+
+                int selectedIndex = -1;
+                for (int i = 0; i < pathCount; i++)
+                {
+                    if (IsInternalTechnology(paths[i].Target.outputTechnology))
+                    {
+                        selectedIndex = i;
+                        break;
+                    }
+                }
+                if (selectedIndex < 0)
+                    selectedIndex = 0;
+
+                ref var path = ref paths[selectedIndex];
+                if ((path.flags & Native.DisplayConfigPathBoostRefreshRate) != 0)
+                    return true;
+
+                uint targetIndex = path.Target.modeInfoIdx;
+                if (targetIndex >= modeCount || modes[targetIndex].infoType != Native.ModeInfoTypeTarget)
+                    return false;
+
+                var sync = modes[targetIndex].mode.targetMode.video.vSyncFreq;
+                if (sync.Denominator == 0)
+                    return false;
+                if (path.Target.refreshRate.Numerator == sync.Numerator
+                    && path.Target.refreshRate.Denominator == sync.Denominator)
+                    return true;
+
+                double targetHz = (double)path.Target.refreshRate.Numerator / path.Target.refreshRate.Denominator;
+                double modeHz = (double)sync.Numerator / sync.Denominator;
+                if (Math.Abs(targetHz - modeHz) > 0.5)
+                    return false;
+
+                path.Target.refreshRate.Numerator = sync.Numerator;
+                path.Target.refreshRate.Denominator = sync.Denominator;
+
+                uint flags = Native.SdcApply | Native.SdcUseSuppliedDisplayConfig | Native.SdcAllowChanges
+                    | Native.SdcSaveToDatabase | Native.SdcVirtualRefreshRateAware;
+                int rc = Native.SetDisplayConfig(pathCount, paths, modeCount, modes, flags);
+                if (rc != 0)
+                {
+                    flags = Native.SdcApply | Native.SdcUseSuppliedDisplayConfig | Native.SdcAllowChanges
+                        | Native.SdcVirtualRefreshRateAware;
+                    rc = Native.SetDisplayConfig(pathCount, paths, modeCount, modes, flags);
+                    if (rc != 0)
+                    {
+                        flags = Native.SdcApply | Native.SdcUseSuppliedDisplayConfig | Native.SdcAllowChanges;
+                        rc = Native.SetDisplayConfig(pathCount, paths, modeCount, modes, flags);
+                    }
+                }
+
+                if (rc == 0)
+                {
+                    ProbeLog.Line($"Normalized static display timing in CCD to {sync.Numerator}/{sync.Denominator}.");
+                    return true;
+                }
+                if (attempt == attempts)
+                    ProbeLog.Line($"CCD static normalization SetDisplayConfig returned rc={rc}.");
+            }
+            catch (Exception ex)
+            {
+                if (attempt == attempts)
+                    ProbeLog.Line($"CCD static refresh rate normalization encountered error: {ex.Message}");
+            }
+
+            if (attempt < attempts && delayMs > 0)
+                Thread.Sleep(delayMs);
         }
         return false;
     }
@@ -1572,7 +1701,7 @@ internal sealed class PanelEdid
         return true;
     }
 
-    public static void BuildOverride(byte[] sourceEdid, IReadOnlyList<byte[]> added, out byte[] block0, out byte[] block1, out byte[][] extras)
+    public static void BuildOverride(byte[] sourceEdid, IReadOnlyList<byte[]> added, out byte[] block0, out byte[] block1, out byte[][] extras, bool patchNvidiaAdaptiveSync = false)
     {
         if (sourceEdid.Length < 256)
             throw new InvalidOperationException("EDID is shorter than 256 bytes.");
@@ -1604,7 +1733,11 @@ internal sealed class PanelEdid
         {
             byte[]? block = others.FirstOrDefault(item => item[0] == tag);
             if (block != null)
+            {
+                if (tag == 0x2B && patchNvidiaAdaptiveSync)
+                    block = PatchNvidiaAdaptiveSyncRange(block);
                 primary.Add(block);
+            }
         }
         Take(0x20);
         Take(0x21);
@@ -1756,6 +1889,19 @@ internal sealed class PanelEdid
             offset += 20;
         }
         return block;
+    }
+
+    private static byte[] PatchNvidiaAdaptiveSyncRange(byte[] block)
+    {
+        if (block.Length < 9 || block[0] != 0x2B || block[2] < 6)
+            return block;
+
+        // NVIDIA needs the panel's full 48–240 Hz range advertised for the Windows DRR option.
+        byte[] patched = (byte[])block.Clone();
+        patched[5] = 48;
+        patched[6] = 240;
+        patched[7] &= 0xFC;
+        return patched;
     }
 
     private static byte[] FinishSection(List<byte[]> blocks, byte productType, int extensionCount)
@@ -1931,6 +2077,12 @@ internal static class Native
     public const int DeviceInfoGetSourceName = 1;
     public const int DeviceInfoGetTargetName = 2;
     public const uint CmLocateDevnodePhantom = 1;
+    public const uint SdcApply = 0x00000080;
+    public const uint SdcUseSuppliedDisplayConfig = 0x00000020;
+    public const uint SdcAllowChanges = 0x00000400;
+    public const uint SdcSaveToDatabase = 0x00000200;
+    public const uint SdcVirtualRefreshRateAware = 0x00020000;
+    public const uint DisplayConfigPathBoostRefreshRate = 0x00000010;
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     public struct DisplayDevice
@@ -2153,6 +2305,14 @@ internal static class Native
         ref uint numModeInfoArrayElements,
         [Out] ModeInfo[] modeInfoArray,
         IntPtr currentTopologyId);
+
+    [DllImport("user32.dll")]
+    public static extern int SetDisplayConfig(
+        uint numPathArrayElements,
+        [In] PathInfo[] pathArray,
+        uint numModeInfoArrayElements,
+        [In] ModeInfo[] modeInfoArray,
+        uint flags);
 
     [DllImport("user32.dll")]
     public static extern int DisplayConfigGetDeviceInfo(ref SourceDeviceName requestPacket);

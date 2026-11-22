@@ -7,6 +7,7 @@ internal static class DriverRestart
     private const int DicsEnable = 0x1;
     private const int DicsDisable = 0x2;
     private const int DicsPropChange = 0x3;
+    private const int DicsFlagGlobal = 0x1;
     private const int DicsFlagConfigSpecific = 0x2;
     private const uint SpdrpDeviceDesc = 0;
     private const uint SpdrpHardwareId = 1;
@@ -206,25 +207,44 @@ internal static class DriverRestart
                         InstallFunction = DifPropertyChange
                     },
                     StateChange = DicsPropChange,
-                    Scope = DicsFlagConfigSpecific,
+                    Scope = targetGpu == "NVIDIA" ? DicsFlagGlobal : DicsFlagConfigSpecific,
                     HwProfile = 0
                 };
 
                 bool queued = SetupDiSetClassInstallParams(set, ref info, ref change, Marshal.SizeOf<SpPropChangeParams>());
                 bool called = queued && SetupDiCallClassInstaller(DifPropertyChange, set, ref info);
 
-                // If DicsPropChange left the device with an error, recover via DicsDisable -> DicsEnable
-                if (CM_Get_DevNode_Status(out uint status, out uint problem, info.DevInst, 0) == 0 && problem != 0)
+                uint status = 0, problem = 0;
+                if (targetGpu == "NVIDIA")
                 {
-                    change.StateChange = DicsDisable;
-                    SetupDiSetClassInstallParams(set, ref info, ref change, Marshal.SizeOf<SpPropChangeParams>());
-                    SetupDiCallClassInstaller(DifPropertyChange, set, ref info);
-                    Thread.Sleep(1000);
+                    for (int attempt = 0; attempt < 15; attempt++)
+                    {
+                        Thread.Sleep(200);
+                        if (CM_Get_DevNode_Status(out status, out problem, info.DevInst, 0) == 0
+                            && (status & DnStarted) != 0 && problem == 0)
+                            break;
+                    }
+                }
+                else
+                {
+                    CM_Get_DevNode_Status(out status, out problem, info.DevInst, 0);
+                }
 
+                if (problem != 0)
+                {
+                    if (targetGpu != "NVIDIA")
+                    {
+                        change.StateChange = DicsDisable;
+                        SetupDiSetClassInstallParams(set, ref info, ref change, Marshal.SizeOf<SpPropChangeParams>());
+                        SetupDiCallClassInstaller(DifPropertyChange, set, ref info);
+                        Thread.Sleep(1000);
+                    }
                     change.StateChange = DicsEnable;
+                    if (targetGpu == "NVIDIA")
+                        change.Scope = DicsFlagGlobal;
                     SetupDiSetClassInstallParams(set, ref info, ref change, Marshal.SizeOf<SpPropChangeParams>());
                     SetupDiCallClassInstaller(DifPropertyChange, set, ref info);
-                    Thread.Sleep(1500);
+                    Thread.Sleep(targetGpu == "NVIDIA" ? 1000 : 1500);
                     CM_Get_DevNode_Status(out status, out problem, info.DevInst, 0);
                 }
 

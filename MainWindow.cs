@@ -97,7 +97,7 @@ public sealed class MainWindow : Window
         header.Children.Add(StepTitle("5 — Repeat for the other GPU"));
         header.Children.Add(StepBody("Switch to the other GPU, then click Refresh. Click Add refresh rates again. On Intel, click Restart driver again."));
         header.Children.Add(StepTitle("6 — Choose a refresh rate"));
-        header.Children.Add(StepBody("Open Windows Settings → System → Display → Advanced display. Choose a refresh rate, and confirm if Windows asks."));
+        header.Children.Add(StepBody("Open Windows Settings → System → Display → Advanced display. Choose 'Dynamic (60 Hz or 240 Hz)' or another refresh rate, and confirm if Windows asks."));
         header.Children.Add(MoreInfo());
         header.Children.Add(_summary);
 
@@ -131,6 +131,7 @@ public sealed class MainWindow : Window
     {
         base.OnSourceInitialized(e);
         IntPtr hwnd = new WindowInteropHelper(this).Handle;
+        HwndSource.FromHwnd(hwnd)?.AddHook(WndProc);
         int enabled = 1;
         DwmSetWindowAttribute(hwnd, 20, ref enabled, sizeof(int));
         DwmSetWindowAttribute(hwnd, 19, ref enabled, sizeof(int));
@@ -138,6 +139,14 @@ public sealed class MainWindow : Window
         int captionText = 0x00FFFFFF;
         DwmSetWindowAttribute(hwnd, 35, ref caption, sizeof(int));
         DwmSetWindowAttribute(hwnd, 36, ref captionText, sizeof(int));
+    }
+
+    private IntPtr WndProc(IntPtr hwnd, int message, IntPtr wParam, IntPtr lParam, ref bool handled)
+    {
+        const int WmDisplayChange = 0x007E;
+        if (message == WmDisplayChange)
+            Dispatcher.InvokeAsync(() => Load(clearLog: false));
+        return IntPtr.Zero;
     }
 
     private void AppendLog(string line)
@@ -201,6 +210,10 @@ public sealed class MainWindow : Window
                     ProbeLog.Line(hz + " Hz  " + detail);
                 }
             }
+
+            if (gpu == "NVIDIA")
+                Task.Run(() => CcdSignal.TryNormalizeStaticRefreshRate(maxAttempts: 3, delayMs: 200));
+
         }
         catch (Exception ex)
         {
