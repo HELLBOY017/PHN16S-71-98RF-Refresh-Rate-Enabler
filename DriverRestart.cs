@@ -213,13 +213,18 @@ internal static class DriverRestart
                 bool queued = SetupDiSetClassInstallParams(set, ref info, ref change, Marshal.SizeOf<SpPropChangeParams>());
                 bool called = queued && SetupDiCallClassInstaller(DifPropertyChange, set, ref info);
 
-                // If DicsPropChange left the device with an error, recover via DicsEnable
+                // If DicsPropChange left the device with an error, recover via DicsDisable -> DicsEnable
                 if (CM_Get_DevNode_Status(out uint status, out uint problem, info.DevInst, 0) == 0 && problem != 0)
                 {
+                    change.StateChange = DicsDisable;
+                    SetupDiSetClassInstallParams(set, ref info, ref change, Marshal.SizeOf<SpPropChangeParams>());
+                    SetupDiCallClassInstaller(DifPropertyChange, set, ref info);
+                    Thread.Sleep(1000);
+
                     change.StateChange = DicsEnable;
                     SetupDiSetClassInstallParams(set, ref info, ref change, Marshal.SizeOf<SpPropChangeParams>());
                     SetupDiCallClassInstaller(DifPropertyChange, set, ref info);
-                    Thread.Sleep(500);
+                    Thread.Sleep(1500);
                     CM_Get_DevNode_Status(out status, out problem, info.DevInst, 0);
                 }
 
